@@ -380,6 +380,7 @@ async function startRelay() {
     log('relay loop running — tap the terminal/phone on board1.', 'ok');
 
     let lastStat = 0;
+    let tPrevDone = performance.now();   // for measuring the wait-gap between APDUs
     while (running) {
       // Mode B, withheld: don't emulate; re-arm the moment the card appears.
       if (gate && !armed) {
@@ -415,6 +416,7 @@ async function startRelay() {
       }
 
       const apdu = r.data;
+      const gap = performance.now() - tPrevDone;   // wait since previous APDU finished
       lastApduAt = Date.now();   // activity -> keep polling tight (adaptive window)
       if (startsWith(apdu, PPSE_HEAD)) {
         log('--- new transaction (tap) --- re-opening mole session', 'ok');
@@ -422,14 +424,21 @@ async function startRelay() {
         apduCount = 0;
       }
       setLedUI('ghost', 'blue'); setLedUI('mole', 'blue');
+      const tGot = performance.now();       // apduRecv already returned this APDU
       let rr;
       try { rr = await mole.relayApdu(apdu); }
       catch (_) { rr = { status: ST.HF_TAG_NO, data: new Uint8Array(0) }; }
+      const tRelay = performance.now();
       const resp = rr.status === ST.HF_TAG_OK ? rr.data : new Uint8Array(0);
       await ghost.apduSend(resp);
+      const tSend = performance.now();
       apduCount++;
       log(`#${apduCount}  ->card ${hex(apdu)}`);
       log(`     card-> ${hex(resp)}  (st=${rr.status})`, resp.length ? '' : 'warn');
+      // timing: gap = wait for this APDU (poll+BLE, what adaptive poll targets),
+      // relay = mole round-trip (BLE+card), send = apduSend BLE write-back
+      log(`     t: gap ${gap.toFixed(0)}ms · relay ${(tRelay - tGot).toFixed(0)}ms · send ${(tSend - tRelay).toFixed(0)}ms`);
+      tPrevDone = tSend;
       if (!resp.length) log('empty card response — terminal will likely abort this APDU', 'warn');
       setLedUI('ghost', 'green'); setLedUI('mole', 'green');
     }
