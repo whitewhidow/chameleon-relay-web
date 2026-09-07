@@ -410,6 +410,12 @@ async function startRelay() {
     log(`relay error: ${e.message || e}`, 'err');
   } finally {
     try { await mole.relayStop(); } catch (_) {}
+    // Release the ghost too, or it's left armed on a solid-red LED: stop
+    // emulating (reader mode) and hand the LED back to the default animation,
+    // so BOTH boards return to regular on Stop.
+    try { await ghost.changeMode(true); } catch (_) {}
+    try { await ghost.setLed(0); } catch (_) {}
+    setLedUI('ghost', ''); setLedUI('mole', '');
     running = false;
     $('status').textContent = 'stopped';
     log(`=== relay stopped after ${apduCount} APDUs ===`);
