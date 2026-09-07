@@ -113,7 +113,11 @@ class ChameleonBLE {
     this.device = null; this.rx = null; this.tx = null;
     this.buf = new Uint8Array(0);
     this.waiters = new Map();   // cmd -> [waiter]
-    this.mtu = 20;              // conservative NUS chunk; device reassembles frames
+    // Optimistic BLE write chunk. Chrome+nRF52 almost always negotiate an MTU
+    // >=185 regardless of link speed, so big frames go in 1-2 writes instead of
+    // ~13. Auto-falls back to 20 (today's behaviour) if a device negotiated the
+    // 23-byte minimum MTU — see _write.
+    this.mtu = 244;
     this.onDisconnect = null;
   }
 
@@ -200,10 +204,23 @@ class ChameleonBLE {
   }
 
   async _write(frame) {
-    for (let i = 0; i < frame.length; i += this.mtu) {
-      const chunk = frame.subarray(i, Math.min(i + this.mtu, frame.length));
-      if (this.rx.writeValueWithoutResponse) await this.rx.writeValueWithoutResponse(chunk);
-      else await this.rx.writeValue(chunk);
+    for (;;) {
+      let sent = 0;
+      try {
+        for (let i = 0; i < frame.length; i += this.mtu) {
+          const chunk = frame.subarray(i, Math.min(i + this.mtu, frame.length));
+          if (this.rx.writeValueWithoutResponse) await this.rx.writeValueWithoutResponse(chunk);
+          else await this.rx.writeValue(chunk);
+          sent = i + chunk.length;
+        }
+        return;
+      } catch (e) {
+        // Only shrink+retry if NOTHING was sent yet (an oversized first chunk on
+        // a tiny-MTU device rejects before transmitting) — so no duplicate/garbled
+        // bytes reach the device. A mid-frame failure is not an MTU issue: rethrow.
+        if (sent === 0 && this.mtu > 20) { this.mtu = 20; continue; }
+        throw e;
+      }
     }
   }
 
@@ -329,7 +346,14 @@ async function startRelay() {
   const mode = document.querySelector('input[name=mode]:checked').value;
   const gate = (mode === 'B');
   const slot = parseInt($('slot').value, 10) || 1;
-  const pollMs = 120;
+  // Adaptive poll: tight while a transaction is live (the phone is WTX-stalled
+  // waiting on us, so every ms of poll gap is added latency), relaxed when idle
+  // to spare BLE/CPU/battery. Safe on a slow link: the transport is strictly
+  // one-command-at-a-time, so the real rate self-caps to the BLE round-trip —
+  // this only removes dead time, it can't flood the connection.
+  const ACTIVE_POLL = 15, IDLE_POLL = 150, ACTIVE_WINDOW = 2500;
+  let lastApduAt = Date.now();
+  const pollDelay = () => (Date.now() - lastApduAt < ACTIVE_WINDOW) ? ACTIVE_POLL : IDLE_POLL;
   $('status').textContent = `relaying (Mode ${mode})`;
   log(`=== relay started: Mode ${mode}${gate ? ' (gate-on-card)' : ''}, slot ${slot} ===`, 'ok');
 
@@ -366,7 +390,7 @@ async function startRelay() {
             log('board2 card seated -> emulation ARMED (phone can read)', 'ok');
           } else { ghost.setLed(3).catch(() => {}); setLedUI('ghost', 'red'); setLedUI('mole', 'red'); }
         }
-        await sleep(pollMs); continue;
+        await sleep(pollDelay()); continue;
       }
 
       let r;
@@ -385,10 +409,11 @@ async function startRelay() {
             setLedUI('ghost', present ? 'green' : 'red'); setLedUI('mole', present ? 'green' : 'red');
           }
         }
-        await sleep(pollMs); continue;
+        await sleep(pollDelay()); continue;
       }
 
       const apdu = r.data;
+      lastApduAt = Date.now();   // activity -> keep polling tight (adaptive window)
       if (startsWith(apdu, PPSE_HEAD)) {
         log('--- new transaction (tap) --- re-opening mole session', 'ok');
         await cloneFromMole(slot);   // re-open the card session for a fresh cryptogram
