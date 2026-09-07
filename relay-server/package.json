@@ -1,0 +1,16 @@
+{
+  "name": "chameleon-relay-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebSocket rendezvous for the Chameleon BLE EMV relay (Phase 2). Lab use only.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

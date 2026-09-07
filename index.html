@@ -56,11 +56,27 @@
 <body>
 <header>
   <h1>Chameleon Ultra — BLE EMV Relay</h1>
-  <div class="sub">Two Ultras, one browser, bridged over Bluetooth. No USB, no host script.</div>
+  <div class="sub">Two Ultras bridged over Bluetooth — one browser (Local), or two phones over the internet (Mole + Ghost via a relay server). No USB, no host script.</div>
   <div class="warn-banner">⚠ Lab / authorised-research use only. Relay only cards you own, against terminals you own or are authorised to test.</div>
 </header>
 
 <main>
+  <div class="controls">
+    <fieldset class="grp">
+      <legend>Role</legend>
+      <label><input type="radio" name="role" value="local" checked> Local · both boards here</label>
+      <label><input type="radio" name="role" value="mole"> Mole · card side</label>
+      <label><input type="radio" name="role" value="ghost"> Ghost · terminal side</label>
+    </fieldset>
+  </div>
+  <div class="controls" id="link-row" hidden>
+    <div class="grp" style="flex:1 1 320px"><label style="flex:1">Relay server
+      <input type="text" id="server-url" placeholder="wss://your-app.onrender.com" style="flex:1;min-width:180px"></label></div>
+    <div class="grp"><label>Room <input type="text" id="room-code" value="lab1" style="width:90px"></label></div>
+    <button id="link-btn">Connect link</button>
+    <span id="link-status">not connected</span>
+  </div>
+
   <div class="boards">
     <div class="card" id="ghost-card">
       <h2><span class="led" id="ghost-led"></span> Board 1 — Ghost</h2>
@@ -77,7 +93,7 @@
   </div>
 
   <div class="controls">
-    <fieldset class="grp">
+    <fieldset class="grp" id="mode-row">
       <legend>Mode</legend>
       <label><input type="radio" name="mode" value="A" checked> A · always emulate</label>
       <label><input type="radio" name="mode" value="B"> B · gate on card</label>
@@ -99,6 +115,9 @@
   Requires the relay firmware (app_version&nbsp;99.x) on both boards and a Web Bluetooth browser
   (desktop or Android Chrome/Edge — not iOS Safari). BLE pairing is disabled on the Ultra by default,
   so no passkey is needed. Mode&nbsp;B mirrors the host tool's <code>--gate-on-card</code>.
+  <br><b>Roles:</b> <b>Local</b> = both boards on this browser. <b>Mole</b>/<b>Ghost</b> = two phones,
+  each with one board, bridged through a relay server (same room code); the Ghost phone drives and the
+  Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
 <script src="relay.js"></script>
