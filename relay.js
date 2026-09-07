@@ -394,7 +394,7 @@ async function startRelay() {
       }
 
       let r;
-      try { r = await ghost.apduRecv(); } catch (_) { await sleep(pollMs); continue; }
+      try { r = await ghost.apduRecv(); } catch (_) { await sleep(pollDelay()); continue; }
       if (r.status !== ST.SUCCESS) {
         const now = Date.now();
         if (now - lastStat > 1000) {
