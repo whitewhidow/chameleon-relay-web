@@ -19,6 +19,7 @@ const PORT = process.env.PORT || 8080;
 const rooms = new Map(); // room -> Set<ws>
 
 const server = http.createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');   // let the browser read /health (wake probe)
   if (req.url === '/health') { res.writeHead(200); res.end('ok'); return; }
   res.writeHead(200, { 'content-type': 'text/plain' });
   res.end('chameleon relay rendezvous — lab use only');
@@ -59,6 +60,7 @@ wss.on('connection', (ws) => {
       announce(room);
       return;
     }
+    if (msg.t === 'ping') { ws.send(JSON.stringify({ t: 'pong' })); return; }   // heartbeat, not forwarded
     // forward everything else to the OTHER member(s) of the room
     if (!ws.room) return;
     const s = rooms.get(ws.room); if (!s) return;

@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-07e phase2';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-07f wake+hb';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -271,8 +271,11 @@ class WSLink {
   constructor() {
     this.ws = null; this.waiters = new Map(); this.onReq = null; this.onPeers = null;
     this.onClose = null; this.peers = 0; this.roles = [];
+    this.hb = null;   // heartbeat interval
     this.mole = new WSMole(this);
   }
+  _startHb() { this._stopHb(); this.hb = setInterval(() => this.send({ t: 'ping' }), 30000); }
+  _stopHb() { if (this.hb) { clearInterval(this.hb); this.hb = null; } }
   get connected() { return !!(this.ws && this.ws.readyState === 1); }
   connect(url, room, role) {
     return new Promise((resolve, reject) => {
@@ -283,15 +286,16 @@ class WSLink {
       ws.onopen = () => ws.send(JSON.stringify({ t: 'join', room, role }));
       ws.onmessage = (ev) => {
         let m; try { m = JSON.parse(ev.data); } catch { return; }
-        if (m.t === 'joined') { clearTimeout(to); this.peers = m.n; this.roles = m.roles || []; resolve(m); return; }
+        if (m.t === 'joined') { clearTimeout(to); this.peers = m.n; this.roles = m.roles || []; this._startHb(); resolve(m); return; }
         if (m.t === 'error') { clearTimeout(to); reject(new Error('link: ' + m.reason)); return; }
+        if (m.t === 'pong') return;   // heartbeat ack
         if (m.t === 'peers') { this.peers = m.n; this.roles = m.roles || []; if (this.onPeers) this.onPeers(m); return; }
         const q = this.waiters.get(m.t);
         if (q && q.length) { const w = q.shift(); clearTimeout(w.to); w.resolve(m); return; }
         if (this.onReq) this.onReq(m);   // inbound request for the mole-serve handler
       };
       ws.onerror = () => {};
-      ws.onclose = () => { this.ws = null; if (this.onClose) this.onClose(); };
+      ws.onclose = () => { this._stopHb(); this.ws = null; if (this.onClose) this.onClose(); };
     });
   }
   send(obj) { if (this.connected) this.ws.send(JSON.stringify(obj)); }
@@ -304,7 +308,7 @@ class WSLink {
       this.send(obj);
     });
   }
-  close() { try { this.ws && this.ws.close(); } catch (_) {} this.ws = null; }
+  close() { this._stopHb(); try { this.ws && this.ws.close(); } catch (_) {} this.ws = null; }
 }
 
 // Ghost-side view of the remote mole: same surface as a ChameleonBLE mole so the
@@ -385,12 +389,39 @@ function applyRole() {
   updateStartEnabled();
 }
 
+// Derive the http(s) /health URL from the ws(s):// server URL.
+function healthUrlFrom(wsUrl) {
+  try {
+    const u = new URL(wsUrl);
+    u.protocol = (u.protocol === 'wss:') ? 'https:' : 'http:';
+    u.pathname = '/health'; u.search = ''; u.hash = '';
+    return u.toString();
+  } catch { return null; }
+}
+
+// Pre-warm a sleeping Render free-tier service: poll /health until it answers.
+async function wakeServer() {
+  const url = healthUrlFrom($('server-url').value.trim());
+  if (!url) { log('enter the relay server URL first', 'warn'); return false; }
+  $('link-status').textContent = 'waking server…';
+  log('waking relay server (free-tier cold start can take ~30-60s)…');
+  const t0 = Date.now();
+  while (Date.now() - t0 < 80000) {
+    try { const r = await fetch(url, { cache: 'no-store' }); if (r.ok) { log('relay server is awake', 'ok'); $('link-status').textContent = 'server awake'; return true; } } catch (_) {}
+    await sleep(3000);
+  }
+  log('relay server did not wake within 80s — try again', 'warn');
+  $('link-status').textContent = 'wake timed out';
+  return false;
+}
+
 async function toggleLink() {
   if (wsLink.connected) { wsLink.close(); return; }
   const url = $('server-url').value.trim();
   const room = $('room-code').value.trim();
   if (!url || !room) { log('enter a server URL and room code', 'warn'); return; }
   try {
+    await wakeServer();   // best-effort pre-warm so the first connect doesn't cold-start-timeout
     log(`connecting to relay ${url} room "${room}" as ${currentRole()}…`);
     wsLink.onClose = () => { log('relay link closed', 'warn'); $('link-btn').textContent = 'Connect link'; $('link-status').textContent = 'not connected'; if (running) stopRelay(); updateStartEnabled(); };
     wsLink.onPeers = (m) => { $('link-status').textContent = `linked · ${m.n}/2 in room (${(m.roles || []).join(', ') || '—'})`; };
@@ -690,10 +721,11 @@ window.addEventListener('DOMContentLoaded', () => {
   $('stop').onclick = stopRelay;
   $('clear').onclick = () => { $('log').innerHTML = ''; };
   $('link-btn').onclick = toggleLink;
+  $('wake-btn').onclick = wakeServer;
   document.querySelectorAll('input[name=role]').forEach(r => r.addEventListener('change', applyRole));
-  // default the server URL sensibly: same host over wss when hosted, ws://localhost for local
+  // default the server URL: our Render relay when hosted (https), ws://localhost for local dev
   $('server-url').value = (location.protocol === 'https:')
-    ? '' : 'ws://localhost:8080';
+    ? 'wss://chameleon-relay-web.onrender.com' : 'ws://localhost:8080';
   setDevUI('ghost', ghost); setDevUI('mole', mole);
   applyRole();
   log(`ready (build ${BUILD}). Pick a role: Local (both boards here) · Mole (card side) · Ghost (terminal side).`);
