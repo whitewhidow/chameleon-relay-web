@@ -22,6 +22,11 @@ Chrome windows** there — one set to **Mole**, one to **Ghost**, both pointing 
 
 ## Deploy to Render (for real phones over 3G/5G/WiFi)
 
+**Easiest — Blueprint:** the repo root has `render.yaml`. In Render: **New → Blueprint
+→ pick this repo → Apply**. It creates the `chameleon-relay` web service (free plan,
+root `relay-server/`, health check `/health`) automatically. Then skip to step 3.
+
+**Or manually:**
 1. New → **Web Service**, point at this repo, root directory `relay-server/`.
 2. Build command `npm install`, start command `npm start`.
 3. Render serves it over TLS, so the phones use **`wss://<your-app>.onrender.com`**

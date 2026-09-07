@@ -1,0 +1,14 @@
+# Render blueprint for the Chameleon relay rendezvous server (Phase 2).
+# Deploy: Render dashboard -> New -> Blueprint -> pick this repo -> Apply.
+# Gives a public wss://<name>.onrender.com the two phones connect to.
+# Lab / authorised-research use only.
+services:
+  - type: web
+    name: chameleon-relay
+    env: node
+    plan: free
+    rootDir: relay-server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
