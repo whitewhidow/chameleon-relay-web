@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-07h wakelock+molelog';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-07i rxdump';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -41,6 +41,7 @@ const CMD = {
   HF14A_4_RELAY_START: 6006,
   HF14A_4_RELAY_APDU: 6007,
   HF14A_4_RELAY_STOP: 6008,
+  HF14A_4_RX_LOG: 6009,           // diagnostic: raw reader frames the ghost received
   HF14A_4_SET_LED: 6010,
   HF14A_4_CARD_PROBE: 6011,
   HF14A_4_APDU_SEND_RECV: 6012,   // send response AND block for next APDU (grouped)
@@ -738,6 +739,27 @@ async function moleServeClone() {
 
 function stopRelay() { running = false; }
 
+// Diagnostic: dump the raw reader frames the ghost captured (cmd 6009), so we can
+// see exactly how a given reader (Flipper, phone, POS) frames its T=CL commands.
+async function dumpRxLog() {
+  if (!ghost.connected) { log('connect the ghost board first', 'warn'); return; }
+  let r;
+  try { r = await ghost.sendCmd(CMD.HF14A_4_RX_LOG, new Uint8Array([0]), 3000); }
+  catch (e) { log('RX log read failed: ' + (e.message || e), 'err'); return; }
+  const d = r.data;
+  if (d.length < 4) { log('RX log empty', 'warn'); return; }
+  const count = d[0], head = d[1], entries = d[2], ebytes = d[3];
+  const n = Math.min(count, entries);
+  log(`--- ghost RX log: ${count} reader frames (showing ${n}, oldest first) ---`, 'ok');
+  for (let k = 0; k < n; k++) {
+    const idx = (head - n + k + entries) % entries;
+    const off = 4 + idx * (1 + ebytes);
+    const lenBits = d[off];
+    const nb = Math.min(Math.round(lenBits / 8), ebytes);
+    log(`  rx[${k}] ${lenBits}b: ${hex(d.slice(off + 1, off + 1 + nb))}`);
+  }
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   if (!navigator.bluetooth) {
     log('Web Bluetooth is not available in this browser. Use desktop or Android Chrome/Edge (not iOS Safari).', 'err');
@@ -748,6 +770,7 @@ window.addEventListener('DOMContentLoaded', () => {
   $('start').onclick = startRelay;
   $('stop').onclick = stopRelay;
   $('clear').onclick = () => { $('log').innerHTML = ''; };
+  $('rxdump-btn').onclick = dumpRxLog;
   $('link-btn').onclick = toggleLink;
   $('wake-btn').onclick = wakeServer;
   document.querySelectorAll('input[name=role]').forEach(r => r.addEventListener('change', applyRole));
