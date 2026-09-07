@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-07f wake+hb';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-07g mole-reset';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -695,6 +695,10 @@ async function handleMoleReq(m) {
 }
 
 async function moleServeClone() {
+  // Close any prior relay session first so the re-scan is clean — otherwise the
+  // card is left in T=CL (ignores the plain probe) and the mole reads as no-card
+  // after a few cycles. relay_stop powers the field off; relay_start re-RATSes.
+  try { await mole.relayStop(); } catch (_) {}
   const t0 = Date.now();
   while (Date.now() - t0 < 2500 && running) {
     try {
