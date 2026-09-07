@@ -18,6 +18,8 @@
  */
 'use strict';
 
+const BUILD = '2026-09-07b adaptive+mtu244';   // shown in the log so you can confirm which version loaded
+
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_RX      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // write  (host -> device)
@@ -461,5 +463,5 @@ window.addEventListener('DOMContentLoaded', () => {
   $('stop').onclick = stopRelay;
   $('clear').onclick = () => { $('log').innerHTML = ''; };
   setDevUI('ghost', ghost); setDevUI('mole', mole);
-  log('ready. Connect board1 (ghost) and board2 (mole), then Start.');
+  log(`ready (build ${BUILD}). Connect board1 (ghost) and board2 (mole), then Start.`);
 });
