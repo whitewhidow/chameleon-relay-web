@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chameleon Ultra BLE Relay</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f25; --panel2: #23272f; --line: #2e333c;
+    --fg: #e6e8ec; --muted: #9aa2ad; --accent: #4da3ff;
+    --green: #2ecc71; --red: #e74c3c; --blue: #3b9dff; --amber: #f1c40f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         background: var(--bg); color: var(--fg); }
+  header { padding: 18px 20px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0 0 4px; font-size: 18px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .warn-banner { background: #3a2a10; color: #ffce7a; border: 1px solid #5c431a;
+                 padding: 8px 12px; border-radius: 6px; margin-top: 10px; font-size: 12.5px; }
+  main { max-width: 900px; margin: 0 auto; padding: 20px; }
+  .boards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 640px) { .boards { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .card.on { border-color: #35507a; }
+  .card h2 { margin: 0 0 2px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+  .card .role { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  .card .status { font-size: 12.5px; color: var(--muted); margin-bottom: 12px; min-height: 18px; }
+  .led { width: 14px; height: 14px; border-radius: 50%; background: #444; box-shadow: 0 0 0 1px #0004 inset; }
+  .led[data-color=green] { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .led[data-color=red]   { background: var(--red);   box-shadow: 0 0 8px var(--red); }
+  .led[data-color=blue]  { background: var(--blue);  box-shadow: 0 0 8px var(--blue); }
+  button { font: inherit; background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+           border-radius: 7px; padding: 8px 14px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: #16406e; border-color: #2b5c96; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin: 18px 0 10px; }
+  .controls .grp { display: flex; align-items: center; gap: 8px; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; margin: 0; }
+  legend { color: var(--muted); font-size: 12px; padding: 0 4px; }
+  label { display: inline-flex; align-items: center; gap: 5px; }
+  input[type=number] { width: 52px; background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+                       border-radius: 6px; padding: 4px 6px; }
+  #status { margin-left: auto; color: var(--muted); font-size: 13px; }
+  #log { background: #0f1114; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+         height: 340px; overflow: auto; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+         white-space: pre-wrap; word-break: break-all; }
+  #log .ok { color: var(--green); } #log .warn { color: var(--amber); } #log .err { color: var(--red); }
+  .logbar { display: flex; align-items: center; gap: 10px; margin: 14px 0 6px; }
+  .logbar h3 { margin: 0; font-size: 13px; color: var(--muted); font-weight: 600; }
+  footer { color: var(--muted); font-size: 12px; padding: 6px 20px 24px; max-width: 900px; margin: 0 auto; }
+  code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Chameleon Ultra — BLE EMV Relay</h1>
+  <div class="sub">Two Ultras, one browser, bridged over Bluetooth. No USB, no host script.</div>
+  <div class="warn-banner">⚠ Lab / authorised-research use only. Relay only cards you own, against terminals you own or are authorised to test.</div>
+</header>
+
+<main>
+  <div class="boards">
+    <div class="card" id="ghost-card">
+      <h2><span class="led" id="ghost-led"></span> Board 1 — Ghost</h2>
+      <div class="role">emulator · sits at the terminal / phone</div>
+      <div class="status" id="ghost-status">not connected</div>
+      <button id="ghost-btn">Connect</button>
+    </div>
+    <div class="card" id="mole-card">
+      <h2><span class="led" id="mole-led"></span> Board 2 — Mole</h2>
+      <div class="role">reader · sits at the card</div>
+      <div class="status" id="mole-status">not connected</div>
+      <button id="mole-btn">Connect</button>
+    </div>
+  </div>
+
+  <div class="controls">
+    <fieldset class="grp">
+      <legend>Mode</legend>
+      <label><input type="radio" name="mode" value="A" checked> A · always emulate</label>
+      <label><input type="radio" name="mode" value="B"> B · gate on card</label>
+    </fieldset>
+    <div class="grp"><label>Slot <input type="number" id="slot" value="1" min="1" max="8"></label></div>
+    <button id="start" class="primary" disabled>Start relay</button>
+    <button id="stop" disabled>Stop</button>
+    <span id="status">idle</span>
+  </div>
+
+  <div class="logbar">
+    <h3>Log</h3>
+    <button id="clear">Clear</button>
+  </div>
+  <div id="log"></div>
+</main>
+
+<footer>
+  Requires the relay firmware (app_version&nbsp;99.x) on both boards and a Web Bluetooth browser
+  (desktop or Android Chrome/Edge — not iOS Safari). BLE pairing is disabled on the Ultra by default,
+  so no passkey is needed. Mode&nbsp;B mirrors the host tool's <code>--gate-on-card</code>.
+</footer>
+
+<script src="relay.js"></script>
+</body>
+</html>
