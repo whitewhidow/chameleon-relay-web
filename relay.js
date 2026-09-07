@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-07c grouping';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-07d tail-trim';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -240,8 +240,13 @@ class ChameleonBLE {
   apduSend(resp) { return this.sendCmd(CMD.HF14A_4_APDU_SEND, concat(u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp)); }
   // Grouped: deliver `resp` (may be empty = pure blocking recv) AND wait on-device
   // for the phone's next APDU, returned in the same round-trip. Kills the poll gap.
-  // Timeout > the firmware's ~600ms on-device block.
-  apduSendRecv(resp) { return this.sendCmd(CMD.HF14A_4_APDU_SEND_RECV, concat(u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp), 2000); }
+  // waitMs (optional) = firmware on-device block timeout; the host RTT allowance
+  // is set above it so the BLE call never times out before the device returns.
+  apduSendRecv(resp, waitMs) {
+    let p = concat(u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp);
+    if (waitMs) p = concat(p, u8([(waitMs >> 8) & 0xff, waitMs & 0xff]));
+    return this.sendCmd(CMD.HF14A_4_APDU_SEND_RECV, p, (waitMs || 600) + 1500);
+  }
   async relayStart() {
     const r = await this.sendCmd(CMD.HF14A_4_RELAY_START, new Uint8Array(0), 3500);
     if (r.status === ST.HF_TAG_OK && r.data.length) r.parsed = parseAntiColl(r.data);
@@ -359,6 +364,10 @@ async function startRelay() {
   // one-command-at-a-time, so the real rate self-caps to the BLE round-trip —
   // this only removes dead time, it can't flood the connection.
   const ACTIVE_POLL = 15, IDLE_POLL = 150, ACTIVE_WINDOW = 2500;
+  // Grouped-fetch on-device block: just above the phone's worst inter-APDU think
+  // time (~230ms observed) so mid-transaction pre-fetch stays reliable, but the
+  // end-of-transaction tail is ~this instead of the 600ms default. Tunable here.
+  const GROUP_WAIT_MS = 400;
   let lastApduAt = Date.now();
   const pollDelay = () => (Date.now() - lastApduAt < ACTIVE_WINDOW) ? ACTIVE_POLL : IDLE_POLL;
   $('status').textContent = `relaying (Mode ${mode})`;
@@ -448,7 +457,7 @@ async function startRelay() {
       // GROUPED: deliver the response AND fetch the next APDU in one round-trip.
       // The on-device wait for the phone's next command replaces the poll gap.
       let rg;
-      try { rg = await ghost.apduSendRecv(resp); }
+      try { rg = await ghost.apduSendRecv(resp, GROUP_WAIT_MS); }
       catch (_) { rg = { status: ST.HF_TAG_NO, data: new Uint8Array(0) }; }
       const tSend = performance.now();
       if (rg.status === ST.SUCCESS) pending = rg.data;   // next APDU in hand -> no gap next iter
