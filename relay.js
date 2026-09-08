@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08h cache-gpo-loopclear';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08g writelock-reclone';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -454,7 +454,6 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 let running = false;
 let apduCount = 0;
 let learnCache = false;                 // learn mode active for this run
-let clearRequested = false;             // Clear-cache asked while the relay loop runs
 let cacheCount = 0;                      // static entries currently in the ghost (host's view)
 const cachedCmds = new Set();           // hex of cmds already cached this session (dedupe)
 
@@ -475,13 +474,6 @@ function isCacheable(apdu) {
   if (c === 0x00 && i === 0xA4) return true;   // SELECT (PPSE / AID)
   if (c === 0x00 && i === 0xB2) return true;   // READ RECORD
   if (c === 0x80 && i === 0xCA) return true;   // GET DATA
-  // GPO MUST be cached too for a read: if SELECT is served from cache the mole card
-  // is never actually selected, so a live GPO hits an unselected card -> 6D00 and the
-  // reader collapses into an AID brute-force. Caching GPO keeps the whole read in the
-  // ghost (mole untouched during the tap). NOTE: this makes the read fully cached;
-  // a real POS *payment* would need GPO+GENERATE AC live with mole state priming
-  // (not done — payments are distance-bound anyway). GENERATE AC (80 AE) stays live.
-  if (c === 0x80 && i === 0xA8) return true;   // GPO
   return false;
 }
 
@@ -706,13 +698,6 @@ async function startRelay() {
     let sawIdle = true;                    // idle since last APDU -> next APDU starts a new tap
     const EMPTY = new Uint8Array([0, 0]);  // resp_len 0 => pure blocking recv (send nothing)
     while (running) {
-      // Honour a Clear-cache request here, in the loop's own context (no concurrent
-      // BLE write to collide with the relay traffic).
-      if (clearRequested) {
-        clearRequested = false;
-        try { await ghost.clearStaticResponses(); cacheReset(); log('ghost static cache cleared', 'ok'); }
-        catch (e) { log('clear cache failed: ' + (e.message || e), 'err'); }
-      }
       // Mode B, withheld: don't emulate; re-arm the moment the card appears.
       if (gate && !armed) {
         const now = Date.now();
@@ -782,17 +767,12 @@ async function startRelay() {
       // the card is back in contact instead of dead-looping.
       if (rr.status !== ST.HF_TAG_OK) {
         emptyStreak++;
-        // Retry recovery every 3 empties (not just once), so a session that went
-        // dead — or a card that briefly lifted off the mole — recovers as soon as
-        // the card is back, instead of dead-looping and counting up forever.
-        if (emptyStreak % 3 === 0) {
-          log(`mole empty ×${emptyStreak} — re-cloning session…`, 'warn');
+        if (emptyStreak === 3) {
+          log('mole giving empty responses — re-cloning session…', 'warn');
           try { await M.relayStop(); } catch (_) {}
           try {
             const rc = await M.relayStart();
-            if (rc.status === ST.HF_TAG_OK && rc.parsed && rc.parsed.ats.length) {
-              log('mole session recovered', 'ok'); emptyStreak = 0; apduCount = 0;
-            }
+            if (rc.status === ST.HF_TAG_OK) { log('mole session recovered', 'ok'); emptyStreak = 0; }
           } catch (_) {}
         }
       } else emptyStreak = 0;
@@ -954,14 +934,6 @@ async function dumpRxLog() {
 
 async function clearCache() {
   if (!ghost.connected) { log('connect the ghost board first', 'warn'); return; }
-  // If the relay loop is running it monopolises the ghost BLE channel; a concurrent
-  // clear collides/times out. Hand the request to the loop, which clears at the next
-  // gap between taps. If idle, clear directly.
-  if (running) {
-    clearRequested = true;
-    log('clear cache requested — will clear at the next gap between taps…', 'ok');
-    return;
-  }
   try { await ghost.clearStaticResponses(); cacheReset(); log('ghost static cache cleared', 'ok'); }
   catch (e) { log('clear cache failed: ' + (e.message || e), 'err'); }
 }
