@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-09a cache-hit-breakdown';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-09b cycle-clean';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -750,7 +750,6 @@ async function startRelay() {
     const anti = await cloneFromMole(M, slot);
     if (!anti) { return; }            // stopped while waiting
     log(`cloned card UID=${hex(anti.uid)} ATQA=${hex(anti.atqa)} SAK=${anti.sak.toString(16)} ATS=${hex(anti.ats)}`, 'ok');
-    const cardTouchT = performance.now();   // first card touch (mole read the card)
 
     let staticPairs = null;
     if (cacheMode === 'prefill') {
@@ -814,7 +813,7 @@ async function startRelay() {
             let served = -1;
             if (cacheMode === 'prefill') { const h = await ghost.hitCount(); if (h >= 0) { served = h - lastHit; lastHit = h; } }
             const mix = served >= 0 ? `${served} cache-served + ${tapN} relayed = ${served + tapN} cmds` : `${tapN} relayed`;
-            log(`=== transaction cycle (${cache}): ${mix} · ghost↔phone ${(tapTlast - tapT0).toFixed(0)} ms (first phone cmd→last) · from first card touch ${(tapTlast - cardTouchT).toFixed(0)} ms (incl. place→tap gap) ===`, 'ok');
+            log(`=== transaction cycle (${cache}): ${(tapTlast - tapT0).toFixed(0)} ms (first phone cmd → last response) · ${mix} ===`, 'ok');
             tapT0 = null; tapN = 0;
           }
           // idle (no APDU within the on-device block): mirror LED / Mode B disarm
