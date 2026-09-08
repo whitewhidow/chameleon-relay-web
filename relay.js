@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-09b cycle-clean';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-09c modeA-only';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -578,7 +578,7 @@ function applyRole() {
   $('ghost-card').hidden = (role === 'mole');
   $('mole-card').hidden = (role === 'ghost');
   $('link-row').hidden = (role === 'local');
-  $('mode-row').hidden = (role === 'mole');   // mole doesn't choose A/B; the ghost does
+  if ($('mode-row')) $('mode-row').hidden = (role === 'mole');   // (Mode selector removed)
   updateStartEnabled();
 }
 
@@ -709,8 +709,12 @@ async function startRelay() {
   curPdol = null; curCdol1 = null; curTermData = {}; recognisedThisRun = false;
   acquireWakeLock();
   updateStartEnabled();
-  const mode = document.querySelector('input[name=mode]:checked').value;
-  const gate = (mode === 'B');
+  // Mode B (card-presence gating) removed: its idle ATQA probe misfired while a
+  // reader looped (the card is ISO-DEP ACTIVE, so ATQA isn't answered), so it
+  // disarmed/re-armed + re-cloned repeatedly and wedged the mole RC522. Mode A
+  // (always emulate) handles looping readers cleanly. gate is now always off.
+  const mode = 'A';
+  const gate = false;
   const slot = parseInt($('slot').value, 10) || 1;
   const cacheMode = ($('cache') && $('cache').value) || 'off';   // 'off' | 'prefill'
   // HCE/phone-card mode: a phone's emulated card only survives ONE continuous

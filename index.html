@@ -94,11 +94,6 @@
   </div>
 
   <div class="controls">
-    <fieldset class="grp" id="mode-row">
-      <legend>Mode</legend>
-      <label><input type="radio" name="mode" value="A" checked> A · always emulate</label>
-      <label><input type="radio" name="mode" value="B"> B · gate on card</label>
-    </fieldset>
     <div class="grp"><label>Slot <input type="number" id="slot" value="1" min="1" max="8"></label></div>
     <div class="grp"><label title="off = pure live relay (reliable, works with any card). on card enter = read the card's static data at Start and serve it instantly (fast taps; best for a single-AID card; re-Start for a different card).">Cache
       <select id="cache">
@@ -133,12 +128,12 @@
 <footer>
   Requires the relay firmware (app_version&nbsp;99.x) on both boards and a Web Bluetooth browser
   (desktop or Android Chrome/Edge — not iOS Safari). BLE pairing is disabled on the Ultra by default,
-  so no passkey is needed. Mode&nbsp;B mirrors the host tool's <code>--gate-on-card</code>.
+  so no passkey is needed. The ghost always emulates once the mole has cloned the card.
   <br><b>Roles:</b> <b>Local</b> = both boards on this browser. <b>Mole</b>/<b>Ghost</b> = two phones,
   each with one board, bridged through a relay server (same room code); the Ghost phone drives and the
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260909b"></script>
+<script src="relay.js?v=20260909c"></script>
 </body>
 </html>
