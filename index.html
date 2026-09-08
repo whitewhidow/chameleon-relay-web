@@ -107,6 +107,8 @@
       </select></label>
       <span id="cache-status" style="color:var(--muted);font-size:12px">cache: empty</span>
     </div>
+    <div class="grp"><label title="Turn ON when the card on the mole is a PHONE/HCE card (Google Wallet pass, phone-emulated tag). Keeps one continuous mole field and never re-clones — a phone's emulated card can't survive the field power-cycling that physical-card recovery does. Use cache OFF with this.">
+      <input type="checkbox" id="hce"> Phone/HCE card</label></div>
     <button id="start" class="primary" disabled>Start relay</button>
     <button id="stop" disabled>Stop</button>
     <span id="status">idle</span>
@@ -136,6 +138,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260908s"></script>
+<script src="relay.js?v=20260908t"></script>
 </body>
 </html>

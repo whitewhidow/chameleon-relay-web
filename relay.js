@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08s setled-id-fix';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08t hce-mode+relaylog';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -675,6 +675,11 @@ async function startRelay() {
   const gate = (mode === 'B');
   const slot = parseInt($('slot').value, 10) || 1;
   const cacheMode = ($('cache') && $('cache').value) || 'off';   // 'off' | 'prefill'
+  // HCE/phone-card mode: a phone's emulated card only survives ONE continuous
+  // reader field. Re-cloning (relayStop/relayStart) power-cycles the mole field
+  // and kills the phone's session + re-randomises its UID. So in this mode we
+  // keep the single initial session: never re-clone, never recover — just relay.
+  const hceMode = !!($('hce') && $('hce').checked);
   // Adaptive poll: tight while a transaction is live (the phone is WTX-stalled
   // waiting on us, so every ms of poll gap is added latency), relaxed when idle
   // to spare BLE/CPU/battery. Safe on a slow link: the transport is strictly
@@ -722,6 +727,9 @@ async function startRelay() {
     let lastStat = 0;
     let pending = null;                    // next APDU already fetched by a grouped send-recv
     let emptyStreak = 0;                   // consecutive empty relay results -> session recovery
+    let stallCount = 0;                    // consecutive failed relays w/ no progress -> graceful stop
+    const STALL_LIMIT = hceMode ? 12 : 30; // give up (clean stop) instead of thrashing/rebooting
+    if (hceMode) log('HCE/phone-card mode: single continuous session, no re-clone/recovery.', 'ok');
     let sawIdle = true;                    // idle since last APDU -> next APDU starts a new tap
     let lastRx = -1;                       // ghost RF-frame counter (cached-tap activity feedback)
     const EMPTY = new Uint8Array([0, 0]);  // resp_len 0 => pure blocking recv (send nothing)
@@ -794,7 +802,7 @@ async function startRelay() {
       // case matters with the cache ON: PPSE is served in-ISR from cache and never
       // reaches the loop, so without this the mole session from the previous tap
       // goes stale and later taps fail. Re-clone gives each tap a fresh session.
-      if (startsWith(apdu, PPSE_HEAD) || sawIdle) {
+      if ((startsWith(apdu, PPSE_HEAD) || sawIdle) && !hceMode) {
         log('--- new transaction (tap) --- re-opening mole session', 'ok');
         await cloneFromMole(M, slot);   // fresh card session for a fresh cryptogram
         apduCount = 0;
@@ -845,8 +853,9 @@ async function startRelay() {
       // few consecutive empties, re-clone the mole session so it recovers the moment
       // the card is back in contact instead of dead-looping.
       if (rr.status !== ST.HF_TAG_OK) {
-        emptyStreak++;
-        if (emptyStreak === 3) {
+        emptyStreak++; stallCount++;
+        // HCE mode: do NOT re-clone (that power-cycle kills the phone session).
+        if (emptyStreak === 3 && !hceMode) {
           log('mole giving empty responses — re-cloning session…', 'warn');
           try { await M.relayStop(); } catch (_) {}
           try {
@@ -854,7 +863,12 @@ async function startRelay() {
             if (rc.status === ST.HF_TAG_OK) { log('mole session recovered', 'ok'); emptyStreak = 0; }
           } catch (_) {}
         }
-      } else emptyStreak = 0;
+        // Graceful stall: stop cleanly instead of thrashing the boards forever.
+        if (stallCount >= STALL_LIMIT) {
+          log(`=== relay stalled: ${stallCount} card responses with no progress — stopping cleanly. ${hceMode ? 'Phone/HCE session likely dropped (field or applet reset).' : 'Card decoupled, or (if a phone) try HCE mode.'} ===`, 'err');
+          break;   // -> finally releases both boards to normal
+        }
+      } else { emptyStreak = 0; stallCount = 0; }
       // GROUPED: deliver the response AND fetch the next APDU in one round-trip.
       // The on-device wait for the phone's next command replaces the poll gap.
       let rg;
