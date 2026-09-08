@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-09f no-per-ppse-reclone';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-09g cleanup+halt';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -674,8 +674,6 @@ async function armGhost(anti, slot, staticPairs) {
   }
   await ghost.changeMode(false);   // tag / emulator mode
 }
-async function armEmulation(anti) { await ghost.setAntiColl(anti); await ghost.changeMode(false); }
-async function disarmEmulation() { await ghost.changeMode(true); }
 
 async function cloneFromMole(M, slot) {
   let warned = false;
@@ -709,12 +707,8 @@ async function startRelay() {
   curPdol = null; curCdol1 = null; curTermData = {}; recognisedThisRun = false;
   acquireWakeLock();
   updateStartEnabled();
-  // Mode B (card-presence gating) removed: its idle ATQA probe misfired while a
-  // reader looped (the card is ISO-DEP ACTIVE, so ATQA isn't answered), so it
-  // disarmed/re-armed + re-cloned repeatedly and wedged the mole RC522. Mode A
-  // (always emulate) handles looping readers cleanly. gate is now always off.
-  const mode = 'A';
-  const gate = false;
+  // (Mode B / card-presence gating was removed: its idle ATQA probe misfired
+  // while a reader looped and churned the mole RC522. The ghost always emulates.)
   const slot = parseInt($('slot').value, 10) || 1;
   const cacheMode = ($('cache') && $('cache').value) || 'off';   // 'off' | 'prefill'
   // HCE/phone-card mode: a phone's emulated card only survives ONE continuous
@@ -734,8 +728,8 @@ async function startRelay() {
   const GROUP_WAIT_MS = 400;
   let lastApduAt = Date.now();
   const pollDelay = () => (Date.now() - lastApduAt < ACTIVE_WINDOW) ? ACTIVE_POLL : IDLE_POLL;
-  $('status').textContent = `relaying (Mode ${mode})`;
-  log(`=== relay started: Mode ${mode}${gate ? ' (gate-on-card)' : ''}, slot ${slot} ===`, 'ok');
+  $("status").textContent = "relaying";
+  log(`=== relay started: slot ${slot} ===`, 'ok');
 
   try {
     // Read the negotiated BLE interval while both boards are still IDLE — doing
@@ -761,9 +755,7 @@ async function startRelay() {
       staticPairs = await buildStaticCache(M);   // read PPSE/SELECT/GPO/records/GETDATA off the live card
     }
     await armGhost(anti, slot, staticPairs);
-    let armed = true;
     ghost.setLed(1).catch(() => {}); setLedUI('ghost', 'green'); setLedUI('mole', 'green');
-    if (gate) log('MODE B: ghost withholds emulation until board2 has the card.', 'ok');
     log('relay loop running — tap the terminal/phone on board1.', 'ok');
 
     let lastStat = 0;
@@ -787,20 +779,6 @@ async function startRelay() {
         try { await ghost.clearStaticResponses(); cacheReset(); log('ghost static cache cleared', 'ok'); }
         catch (e) { log('clear cache failed: ' + (e.message || e), 'err'); }
       }
-      // Mode B, withheld: don't emulate; re-arm the moment the card appears.
-      if (gate && !armed) {
-        const now = Date.now();
-        if (now - lastStat > 500) {
-          lastStat = now;
-          if (await safeProbe(M)) {
-            await armEmulation(anti); armed = true;
-            ghost.setLed(1).catch(() => {}); setLedUI('ghost', 'green'); setLedUI('mole', 'green');
-            log('board2 card seated -> emulation ARMED (phone can read)', 'ok');
-          } else { ghost.setLed(3).catch(() => {}); setLedUI('ghost', 'red'); setLedUI('mole', 'red'); }
-        }
-        await sleep(pollDelay()); continue;
-      }
-
       // Get the APDU to process: one a prior grouped send-recv already fetched
       // (no wait), else block ON-DEVICE for the next one (no polling round-trips).
       let apdu;
@@ -817,22 +795,16 @@ async function startRelay() {
             let served = -1;
             if (cacheMode === 'prefill') { const h = await ghost.hitCount(); if (h >= 0) { served = h - lastHit; lastHit = h; } }
             const mix = served >= 0 ? `${served} cache-served + ${tapN} relayed = ${served + tapN} cmds` : `${tapN} relayed`;
-            log(`=== transaction cycle (${cache}): ${(tapTlast - tapT0).toFixed(0)} ms (first phone cmd → last response) · ${mix} ===`, 'ok');
+            log(`=== transaction cycle (${cache}): ghost↔phone ${(tapTlast - tapT0).toFixed(0)} ms (first phone cmd → last response) · ${mix} ===`, 'ok');
             tapT0 = null; tapN = 0;
           }
           // idle (no APDU within the on-device block): mirror LED / Mode B disarm
           const now = Date.now();
           if (now - lastStat > 1000) {
             lastStat = now;
-            const present = await safeProbe(M);
-            if (gate && !present) {
-              await disarmEmulation(); armed = false;
-              ghost.setLed(3).catch(() => {}); setLedUI('ghost', 'red'); setLedUI('mole', 'red');
-              log('board2 card removed -> emulation WITHHELD (phone sees nothing)', 'warn');
-            } else {
-              ghost.setLed(present ? 1 : 3).catch(() => {});
-              setLedUI('ghost', present ? 'green' : 'red'); setLedUI('mole', present ? 'green' : 'red');
-            }
+            const present = await safeProbe(M);   // is the card still on the mole?
+            ghost.setLed(present ? 1 : 3).catch(() => {});
+            setLedUI('ghost', present ? 'green' : 'red'); setLedUI('mole', present ? 'green' : 'red');
             // Cached-tap feedback: with cache ON a tap is served in-ISR and never
             // reaches us, so the portal looks idle. The ghost's RF-frame counter still
             // climbs — surface it so you can see a cached tap happened.
