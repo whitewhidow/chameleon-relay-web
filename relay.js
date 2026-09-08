@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08y cycle-timer';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08z cycle-timer-fix';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -888,6 +888,10 @@ async function startRelay() {
         if (apdu[0] === 0x00 && apdu[1] === 0xA4) { const p = tlvFind(resp, 0x9f38)[0]; if (p) curPdol = p; }
         if (apdu[0] === 0x00 && apdu[1] === 0xB2 && !curCdol1) { const c = tlvFind(resp, 0x8c)[0]; if (c) curCdol1 = c; }
       }
+      // "fully read" = response ready to deliver, BEFORE the grouped fetch's wait
+      // (which on the final command idles ~GROUP_WAIT_MS for a next command that
+      // never comes — that would inflate the cycle).
+      tapTlast = performance.now();
       // Session auto-recovery: if the card decouples mid-transaction the mole
       // fast-fails (empty) on every APDU and a chatty reader loops forever. After a
       // few consecutive empties, re-clone the mole session so it recovers the moment
@@ -933,7 +937,6 @@ async function startRelay() {
       // round-trip, sendrecv = deliver response + on-device wait for the next APDU
       log(`     t: wait ${wait.toFixed(0)}ms · relay ${(tRelay - tGot).toFixed(0)}ms · sendrecv ${(tSend - tRelay).toFixed(0)}ms`);
       if (!resp.length) log('empty card response — terminal will likely abort this APDU', 'warn');
-      tapTlast = tSend;   // last response delivered to the phone = "fully read" moment
       setLedUI('ghost', 'green'); setLedUI('mole', 'green');
     }
   } catch (e) {
