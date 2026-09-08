@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08j cleanup';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08k rrp-readout';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -333,6 +333,14 @@ class ChameleonBLE {
   // sets them, but they are flash-backed and persist, so a stray cache (e.g. from a
   // debug tool) would make the ghost answer from cache instead of relaying live.
   clearStaticResponses() { return this.sendCmd(CMD.HF14A_4_STATIC_RESP, u8([0]), 3000); }
+  // Lightweight activity read: the RX ring buffer's frame counter (first byte of
+  // the RX_LOG response). Increases on every RF frame the ghost receives from a
+  // reader — so it climbs even when a tap is served entirely from cache (in-ISR)
+  // and never reaches the host. Used to show cached-tap feedback in the portal.
+  async rxCount() {
+    try { const r = await this.sendCmd(CMD.HF14A_4_RX_LOG, u8([0]), 2000); return r.data.length ? r.data[0] : -1; }
+    catch (_) { return -1; }
+  }
   // Load one cached cmd->resp pair: cmd_len(1) cmd(n) resp_len_be16(2) resp(m).
   addStaticResponse(cmd, resp) {
     const p = concat(u8([cmd.length]), cmd, u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp);
@@ -682,6 +690,7 @@ async function startRelay() {
     let pending = null;                    // next APDU already fetched by a grouped send-recv
     let emptyStreak = 0;                   // consecutive empty relay results -> session recovery
     let sawIdle = true;                    // idle since last APDU -> next APDU starts a new tap
+    let lastRx = -1;                       // ghost RF-frame counter (cached-tap activity feedback)
     const EMPTY = new Uint8Array([0, 0]);  // resp_len 0 => pure blocking recv (send nothing)
     while (running) {
       // Clear-cache requested from the button: do it here, in the loop's own context
@@ -728,6 +737,17 @@ async function startRelay() {
               ghost.setLed(present ? 1 : 3).catch(() => {});
               setLedUI('ghost', present ? 'green' : 'red'); setLedUI('mole', present ? 'green' : 'red');
             }
+            // Cached-tap feedback: with cache ON a tap is served in-ISR and never
+            // reaches us, so the portal looks idle. The ghost's RF-frame counter still
+            // climbs — surface it so you can see a cached tap happened.
+            if (cacheMode === 'prefill') {
+              const rc = await ghost.rxCount();
+              if (rc >= 0 && lastRx >= 0 && rc !== lastRx) {
+                setLedUI('ghost', 'blue'); setLedUI('mole', 'blue');
+                log(`cached tap: ghost served ${((rc - lastRx + 256) % 256)} reader frame(s) from cache`, 'ok');
+              }
+              if (rc >= 0) lastRx = rc;
+            }
           }
           sawIdle = true;   // no APDU this window -> the next one starts a new tap
           continue;   // the ~600ms block already paced us; no extra sleep
@@ -747,6 +767,11 @@ async function startRelay() {
         apduCount = 0;
       }
       sawIdle = false;
+      // Terminal RRP enforcement: EXCHANGE RELAY RESISTANCE DATA (80 EA). If the
+      // reader sends this, it is time-checking the relay (distance bounding).
+      if (apdu.length >= 2 && apdu[0] === 0x80 && apdu[1] === 0xEA) {
+        log('⚠ terminal sent EXCHANGE RELAY RESISTANCE DATA (80 EA) — this reader ENFORCES RRP; the relay is being time-checked', 'warn');
+      }
       setLedUI('ghost', 'blue'); setLedUI('mole', 'blue');
       const tGot = performance.now();
       let rr;
@@ -931,6 +956,44 @@ async function clearCache() {
   catch (e) { log('clear cache failed: ' + (e.message || e), 'err'); }
 }
 
+// RRP-capability readout for YOUR OWN card: read each AID's AIP (Relay Resistance
+// bit) and probe EXCHANGE RELAY RESISTANCE DATA (80 EA). Tells you whether the card
+// is relay-hardened. Diagnostic only; run with the card on the mole, relay stopped.
+async function checkRRP() {
+  if (running) { log('stop the relay first, then Check RRP', 'warn'); return; }
+  if (!mole.connected) { log('connect the mole board first', 'warn'); return; }
+  const M = mole;
+  try { await M.changeMode(true); } catch (_) {}
+  try { await M.relayStop(); } catch (_) {}
+  log('RRP check: reading card on the mole…', 'ok');
+  let anti = null;
+  for (let i = 0; i < 20; i++) {
+    try { const r = await M.relayStart(); if (r.status === ST.HF_TAG_OK && r.parsed && r.parsed.ats.length) { anti = r.parsed; break; } } catch (_) {}
+    await sleep(300);
+  }
+  if (!anti) { log('RRP check: no card on the mole', 'warn'); return; }
+  const rly = async (a) => { try { const r = await M.relayApdu(a); return r.status === ST.HF_TAG_OK ? r.data : new Uint8Array(0); } catch (_) { return new Uint8Array(0); } };
+  const fci = await rly(hexToBytes('00A404000E325041592E5359532E444446303100'));
+  const seen = new Set();
+  const aids = parseAids(fci).filter(a => { const h = hxc(a); if (seen.has(h)) return false; seen.add(h); return true; });
+  if (!aids.length) { log('RRP check: no AIDs in PPSE (card read failed?)', 'warn'); }
+  for (const aid of aids) {
+    const sel = concat(u8([0x00, 0xa4, 0x04, 0x00, aid.length]), aid, u8([0x00]));
+    if (!sw9000(await rly(sel))) { log(`RRP: ${hxc(aid)} SELECT failed`, 'warn'); continue; }
+    const gr = await rly(hexToBytes('80A8000002830000'));
+    const aip = tlvFind(gr, 0x82)[0];
+    const aipBit = aip && aip.length >= 1 ? !!(aip[0] & 0x01) : null;   // M/Chip AIP b1b1 (best-effort)
+    // Probe: EXCHANGE RELAY RESISTANCE DATA, 4-byte terminal entropy
+    const rrp = await rly(hexToBytes('80EA000004AABBCCDD00'));
+    const supported = rrp.length > 2 && sw9000(rrp);   // real RRP response vs error SW
+    const sw = rrp.length >= 2 ? hxc(rrp.slice(-2)) : '(none)';
+    log(`RRP  AID ${hxc(aid)}: AIP=${aip ? hxc(aip) : '?'} (relay-resist bit≈${aipBit}) · 80EA probe → ${supported ? 'SUPPORTED (relay-hardened)' : 'not supported (SW ' + sw + ')'}`,
+        supported ? 'warn' : 'ok');
+  }
+  try { await M.relayStop(); } catch (_) {}
+  log('RRP check done. (AIP bit is best-effort; the 80EA probe result is authoritative.)', 'ok');
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   if (!navigator.bluetooth) {
     log('Web Bluetooth is not available in this browser. Use desktop or Android Chrome/Edge (not iOS Safari).', 'err');
@@ -943,6 +1006,7 @@ window.addEventListener('DOMContentLoaded', () => {
   $('clear').onclick = () => { $('log').innerHTML = ''; };
   $('rxdump-btn').onclick = dumpRxLog;
   $('clearcache-btn').onclick = clearCache;
+  if ($('rrp-btn')) $('rrp-btn').onclick = checkRRP;
   $('link-btn').onclick = toggleLink;
   $('wake-btn').onclick = wakeServer;
   document.querySelectorAll('input[name=role]').forEach(r => r.addEventListener('change', applyRole));
