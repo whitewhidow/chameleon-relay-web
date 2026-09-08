@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-09c modeA-only';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-09d reset-per-read';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -751,7 +751,7 @@ async function startRelay() {
     await ghost.changeMode(true);
     ghost.setLed(3).catch(() => {}); setLedUI('ghost', 'red');
 
-    const anti = await cloneFromMole(M, slot);
+    let anti = await cloneFromMole(M, slot);
     if (!anti) { return; }            // stopped while waiting
     log(`cloned card UID=${hex(anti.uid)} ATQA=${hex(anti.atqa)} SAK=${anti.sak.toString(16)} ATS=${hex(anti.ats)}`, 'ok');
 
@@ -773,6 +773,7 @@ async function startRelay() {
     const STALL_LIMIT = hceMode ? 12 : 30; // give up (clean stop) instead of thrashing/rebooting
     if (hceMode) log('HCE/phone-card mode: single continuous session, no re-clone/recovery.', 'ok');
     let sawIdle = true;                    // idle since last APDU -> next APDU starts a new tap
+    let skipNextReclone = false;           // set after a full reset: mole is already fresh, don't re-clone again
     let lastRx = -1;                       // ghost RF-frame counter (cached-tap activity feedback)
     // Transaction cycle timer: wall time from the FIRST APDU of a tap (card first
     // driven by the phone) to the LAST (phone finished reading). Logged when the
@@ -811,7 +812,9 @@ async function startRelay() {
         let r0;
         try { r0 = await ghost.apduSendRecv(EMPTY); } catch (_) { await sleep(pollDelay()); continue; }
         if (r0.status !== ST.SUCCESS) {
-          // Tap just ended -> report cycle spans + cache-served/relayed breakdown.
+          // Read just completed (phone went idle) -> report cycle, then RESET TO
+          // THE START STATE: drop emulation, re-clone the card, re-arm the ghost —
+          // so the next read starts exactly like a fresh Start (no carried state).
           if (tapT0 !== null && tapN > 0) {
             const cache = cacheMode === 'prefill' ? 'cache ON' : 'cache OFF';
             let served = -1;
@@ -819,6 +822,21 @@ async function startRelay() {
             const mix = served >= 0 ? `${served} cache-served + ${tapN} relayed = ${served + tapN} cmds` : `${tapN} relayed`;
             log(`=== transaction cycle (${cache}): ${(tapTlast - tapT0).toFixed(0)} ms (first phone cmd → last response) · ${mix} ===`, 'ok');
             tapT0 = null; tapN = 0;
+            if (!hceMode) {
+              try { await ghost.changeMode(true); } catch (_) {}   // drop emulation
+              setLedUI('ghost', 'red');
+              const a2 = await cloneFromMole(M, slot);             // fresh card session
+              if (a2) anti = a2;
+              if (running) {
+                await armGhost(anti, slot, staticPairs);           // re-arm (reloads cache if any)
+                ghost.setLed(1).catch(() => {}); setLedUI('ghost', 'green'); setLedUI('mole', 'green');
+                log('--- reset to start state (re-cloned + re-armed) — ready for next read ---', 'ok');
+              }
+              pending = null; apduCount = 0; curPdol = null; curCdol1 = null;
+              if (!rrpSeenThisRun) rrpResolved = false;
+              lastHit = (cacheMode === 'prefill') ? 0 : lastHit;   // armGhost cleared the cache -> hits reset
+              skipNextReclone = true;   // mole is freshly cloned; don't re-clone on the next PPSE (no churn)
+            }
           }
           // idle (no APDU within the on-device block): mirror LED / Mode B disarm
           const now = Date.now();
@@ -859,13 +877,14 @@ async function startRelay() {
       // case matters with the cache ON: PPSE is served in-ISR from cache and never
       // reaches the loop, so without this the mole session from the previous tap
       // goes stale and later taps fail. Re-clone gives each tap a fresh session.
-      if ((startsWith(apdu, PPSE_HEAD) || sawIdle) && !hceMode) {
+      if ((startsWith(apdu, PPSE_HEAD) || sawIdle) && !hceMode && !skipNextReclone) {
         log('--- new transaction (tap) --- re-opening mole session', 'ok');
         await cloneFromMole(M, slot);   // fresh card session for a fresh cryptogram
         apduCount = 0;
         curPdol = null; curCdol1 = null;   // DOL layouts are per-card/per-tap
         if (!rrpSeenThisRun) rrpResolved = false;  // re-watch RRP for the new tap
       }
+      skipNextReclone = false;   // one-shot: consumed on the first APDU after a reset
       sawIdle = false;
       // Terminal RRP enforcement: EXCHANGE RELAY RESISTANCE DATA (80 EA). If the
       // reader sends this, it is time-checking the relay (distance bounding).
