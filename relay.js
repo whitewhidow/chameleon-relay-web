@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08v payment-safe-cache';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08w faster-prefill';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -163,7 +163,6 @@ function sw9000(r) { return r && r.length >= 2 && r[r.length - 2] === 0x90 && r[
 async function buildStaticCache(M) {
   const pairs = [];
   const PPSE = hexToBytes('00A404000E325041592E5359532E444446303100');
-  const GETDATA = [0x9f13, 0x9f17, 0x9f36, 0x9f4f, 0x9f5b, 0x9f79];
   const rly = async (apdu) => { try { const r = await M.relayApdu(apdu); return r.status === ST.HF_TAG_OK ? r.data : new Uint8Array(0); } catch (_) { return new Uint8Array(0); } };
   const fci = await rly(PPSE);
   if (!(fci.length > 2)) { log('cache: PPSE relay failed — skipping cache', 'warn'); return pairs; }
@@ -182,21 +181,21 @@ async function buildStaticCache(M) {
     if (sw9000(gr)) {
       // NOT cached: GPO is state-critical + dynamic at a real POS. We only relay it
       // here to read the AFL so we know which records to cache.
+      // Cache only the records the AFL actually lists (r1..r2) and only the ones
+      // that succeed — the old r2+1 over-read just fetched a guaranteed 6a83.
       for (const { sfi, r1, r2 } of parseAfl(gr)) {
-        for (let rec = r1; rec <= r2 + 1; rec++) {
+        for (let rec = r1; rec <= r2; rec++) {
           const rr = u8([0x00, 0xb2, rec, (sfi << 3) | 0x04, 0x00]);
           const rd = await rly(rr);
-          if (rd.length >= 2) pairs.push({ cmd: rr, resp: rd });
+          if (sw9000(rd)) pairs.push({ cmd: rr, resp: rd });
         }
       }
     }
-    for (const tag of GETDATA) {
-      const gd = u8([0x80, 0xca, (tag >> 8) & 0xff, tag & 0xff, 0x00]);
-      const rd = await rly(gd);
-      if (rd.length >= 2) pairs.push({ cmd: gd, resp: rd });
-    }
+    // GET DATA is NOT cached: some tags are dynamic (9F36 ATC increments every
+    // transaction, 9F17 PIN-try counter), so a cached value would go stale — the
+    // same hazard as caching GPO. They fall through to live relay per tap.
   }
-  log(`cache: built ${pairs.length} static pairs`, 'ok');
+  log(`cache: built ${pairs.length} static pairs (PPSE + records)`, 'ok');
   return pairs;
 }
 
