@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-09e modeA-stable';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-09f no-per-ppse-reclone';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -859,7 +859,14 @@ async function startRelay() {
       // case matters with the cache ON: PPSE is served in-ISR from cache and never
       // reaches the loop, so without this the mole session from the previous tap
       // goes stale and later taps fail. Re-clone gives each tap a fresh session.
-      if ((startsWith(apdu, PPSE_HEAD) || sawIdle) && !hceMode) {
+      // Re-clone ONLY on a real idle gap (a distinct tap), NOT on every PPSE.
+      // Re-cloning per PPSE meant relayStop/relayStart on every loop pass, and
+      // under a continuously-looping reader that RC522 churn accumulates and wedges
+      // the card (first reads fine, then it degrades into a brute-force + silence).
+      // Keeping one mole session across a loop is fine for reads; a distinct tap
+      // still re-clones because the idle sets sawIdle. (cache-ON already relies on
+      // sawIdle since PPSE is served in-ISR and never reaches the loop.)
+      if (sawIdle && !hceMode) {
         log('--- new transaction (tap) --- re-opening mole session', 'ok');
         await cloneFromMole(M, slot);   // fresh card session for a fresh cryptogram
         apduCount = 0;
