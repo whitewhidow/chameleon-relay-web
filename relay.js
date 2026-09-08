@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260908 trace2';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260908 trace3';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -1727,6 +1727,7 @@ function parseRelayLog(d) {
 }
 async function exportTrace() {
   if (!ghost.connected && !mole.connected) { log('connect a board first', 'err'); return; }
+  if (running || rrpTestRunning || sniffRunning) { log('STOP the running session first, then Export trace — an active relay/RRP-test/sniff monopolises the board BLE channel and the log read times out (the ring buffers persist after Stop, so nothing is lost)', 'warn'); return; }
   const trace = {
     exported: new Date().toISOString(), build: BUILD,
     note: 'ts = app_timer ticks @16384Hz (ms=ts/16.384). ghost.frames = reader<->ghost both directions on the ghost clock; mole.exchanges = mole<->card on the mole clock.',
