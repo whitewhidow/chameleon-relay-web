@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08l rrp-aip-bit';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08m genac-latency-test';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -956,6 +956,109 @@ async function clearCache() {
   catch (e) { log('clear cache failed: ' + (e.message || e), 'err'); }
 }
 
+// --- DOL (PDOL/CDOL) synthesis for the payment-flow test ---------------------
+// Default terminal values for the tags a card asks for. Enough to make the card
+// compute a cryptogram (for latency measurement); NOT a real/authorisable txn.
+function bcd(n) { return ((Math.floor(n / 10) << 4) | (n % 10)) & 0xff; }
+function dolValue(tag, len) {
+  const out = new Uint8Array(len);            // default = zeros
+  const put = (arr) => { const b = u8(arr); out.set(b.slice(0, len), Math.max(0, len - b.length)); };
+  const now = new Date();
+  switch (tag) {
+    case 0x9F02: put([0, 0, 0, 0, 1, 0]); break;                 // amount authorised = 1.00
+    case 0x9F1A: put([0x00, 0x56]); break;                       // terminal country (BE)
+    case 0x5F2A: put([0x09, 0x78]); break;                       // txn currency (EUR)
+    case 0x9A:   put([bcd(now.getFullYear() % 100), bcd(now.getMonth() + 1), bcd(now.getDate())]); break;
+    case 0x9F21: put([bcd(now.getHours()), bcd(now.getMinutes()), bcd(now.getSeconds())]); break;
+    case 0x9C:   put([0x00]); break;                             // txn type = purchase
+    case 0x9F35: put([0x22]); break;                             // terminal type
+    case 0x9F33: put([0xE0, 0xF8, 0xC8]); break;                 // terminal capabilities
+    case 0x9F66: put([0x36, 0x00, 0x00, 0x00]); break;           // TTQ (contactless)
+    case 0x9F37: { const r = new Uint8Array(len); crypto.getRandomValues(r); out.set(r); break; }  // unpredictable number
+    default: break;                                             // everything else = zeros
+  }
+  return out;
+}
+// Parse a DOL (tag-length pairs) and build the concatenated value string.
+function buildDol(dol) {
+  const parts = []; let i = 0;
+  while (i < dol.length) {
+    let tag = dol[i], tl = 1;
+    if ((dol[i] & 0x1f) === 0x1f) { tag = (dol[i] << 8) | dol[i + 1]; tl = 2; }
+    i += tl; if (i >= dol.length) break;
+    const len = dol[i++];
+    parts.push(dolValue(tag, len));
+  }
+  return concat(...parts);
+}
+
+// Payment-flow latency test on YOUR OWN card (mole-driven, no POS). Runs
+// PPSE->SELECT->GPO->READ->GENERATE AC with synthetic terminal data and times
+// GENERATE AC. Produces a structurally-valid ARQC for LATENCY MEASUREMENT ONLY —
+// it is never submitted anywhere (that would be fraud). Full relay round-trip is
+// estimated = measured card time + the ghost/BLE leg seen in live-read logs.
+async function testPayment() {
+  if (running) { log('stop the relay first, then Test payment', 'warn'); return; }
+  if (!mole.connected) { log('connect the mole board first', 'warn'); return; }
+  const M = mole;
+  try { await M.changeMode(true); } catch (_) {}
+  try { await M.relayStop(); } catch (_) {}
+  log('payment test: opening card on the mole…', 'ok');
+  let anti = null;
+  for (let k = 0; k < 20; k++) {
+    try { const r = await M.relayStart(); if (r.status === ST.HF_TAG_OK && r.parsed && r.parsed.ats.length) { anti = r.parsed; break; } } catch (_) {}
+    await sleep(300);
+  }
+  if (!anti) { log('payment test: no card on the mole', 'warn'); return; }
+  const timed = async (apdu) => {
+    const t0 = performance.now();
+    let d = new Uint8Array(0);
+    try { const r = await M.relayApdu(apdu); if (r.status === ST.HF_TAG_OK) d = r.data; } catch (_) {}
+    return { d, ms: performance.now() - t0 };
+  };
+  const fci = (await timed(hexToBytes('00A404000E325041592E5359532E444446303100'))).d;
+  const seen = new Set();
+  const aids = parseAids(fci).filter(a => { const h = hxc(a); if (seen.has(h)) return false; seen.add(h); return true; });
+  let done = false;
+  for (const aid of aids) {
+    if (done) break;
+    const selResp = (await timed(concat(u8([0x00, 0xa4, 0x04, 0x00, aid.length]), aid, u8([0x00])))).d;
+    if (!sw9000(selResp)) continue;
+    // GPO with the card's PDOL (9F38) filled, else empty
+    const pdol = tlvFind(selResp, 0x9f38)[0];
+    const gpoData = pdol ? concat(u8([0x83]), u8([buildDol(pdol).length]), buildDol(pdol)) : hexToBytes('8300');
+    const gpoCmd = concat(u8([0x80, 0xa8, 0x00, 0x00, gpoData.length]), gpoData, u8([0x00]));
+    const gpo = await timed(gpoCmd);
+    if (!sw9000(gpo.d)) { log(`payment test ${hxc(aid)}: GPO -> ${hxc(gpo.d.slice(-2))}`, 'warn'); continue; }
+    // read records to find CDOL1 (8C)
+    let cdol1 = null; const records = [];
+    for (const { sfi, r1, r2 } of parseAfl(gpo.d)) {
+      for (let rec = r1; rec <= r2; rec++) {
+        const rd = (await timed(u8([0x00, 0xb2, rec, (sfi << 3) | 0x04, 0x00]))).d;
+        if (sw9000(rd)) { records.push(rd); const c = tlvFind(rd, 0x8c)[0]; if (c) cdol1 = c; }
+      }
+    }
+    if (!cdol1) { log(`payment test ${hxc(aid)}: no CDOL1 (tag 8C) found — cannot GENERATE AC on this AID`, 'warn'); continue; }
+    // GENERATE AC (ARQC, P1=0x80) with synthetic CDOL data
+    const cdolData = buildDol(cdol1);
+    const genac = concat(u8([0x80, 0xae, 0x80, 0x00, cdolData.length]), cdolData, u8([0x00]));
+    const ac = await timed(genac);
+    const ok = ac.d.length > 2 && sw9000(ac.d);
+    log(`payment test AID ${hxc(aid)}: GENERATE AC -> ${ok ? 'cryptogram returned' : 'SW ' + hxc(ac.d.slice(-2) || [])}`, ok ? 'ok' : 'warn');
+    if (ok) {
+      const cid = tlvFind(ac.d, 0x9f27)[0], atc = tlvFind(ac.d, 0x9f36)[0], arqc = tlvFind(ac.d, 0x9f26)[0];
+      log(`   CID=${cid ? hxc(cid) : '?'} ATC=${atc ? hxc(atc) : '?'} cryptogram=${arqc ? hxc(arqc) : '(in 77 template)'}`);
+      log(`   GENERATE AC card time (mole-direct): ${ac.ms.toFixed(0)} ms`, 'ok');
+      log(`   est. FULL relay round-trip ≈ ${ac.ms.toFixed(0)} + ~200 ms (ghost+BLE leg from read logs) ≈ ${(ac.ms + 200).toFixed(0)} ms`, 'ok');
+      log(`   (structurally-valid ARQC for latency only — NOT submitted anywhere)`, 'warn');
+      done = true;
+    }
+  }
+  if (!done) log('payment test: no AID produced a cryptogram (card may need CDA/P1=0x90 or a fuller CDOL)', 'warn');
+  try { await M.relayStop(); } catch (_) {}
+  log('payment test done.', 'ok');
+}
+
 // RRP-capability readout for YOUR OWN card: read each AID's AIP (Relay Resistance
 // bit) and probe EXCHANGE RELAY RESISTANCE DATA (80 EA). Tells you whether the card
 // is relay-hardened. Diagnostic only; run with the card on the mole, relay stopped.
@@ -1008,6 +1111,7 @@ window.addEventListener('DOMContentLoaded', () => {
   $('rxdump-btn').onclick = dumpRxLog;
   $('clearcache-btn').onclick = clearCache;
   if ($('rrp-btn')) $('rrp-btn').onclick = checkRRP;
+  if ($('genac-btn')) $('genac-btn').onclick = testPayment;
   $('link-btn').onclick = toggleLink;
   $('wake-btn').onclick = wakeServer;
   document.querySelectorAll('input[name=role]').forEach(r => r.addEventListener('change', applyRole));
