@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08q conn-interval-log';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08r conn-interval-fix';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -691,6 +691,10 @@ async function startRelay() {
   log(`=== relay started: Mode ${mode}${gate ? ' (gate-on-card)' : ''}, slot ${slot} ===`, 'ok');
 
   try {
+    // Read the negotiated BLE interval while both boards are still IDLE — doing
+    // it after arming would inject a command into the ghost while the relay loop
+    // has taken over its BLE channel, which desyncs/crashes the emulation.
+    await logConnParams();
     // Put the MOLE into reader mode first: this initialises the RC522. Probing
     // the field (card_probe/relay_start) before this faults the board on an
     // uninitialised RC522 and drops BLE (role_mole does set_device_reader_mode).
@@ -714,7 +718,6 @@ async function startRelay() {
     ghost.setLed(1).catch(() => {}); setLedUI('ghost', 'green'); setLedUI('mole', 'green');
     if (gate) log('MODE B: ghost withholds emulation until board2 has the card.', 'ok');
     log('relay loop running — tap the terminal/phone on board1.', 'ok');
-    logConnParams();   // report the negotiated BLE interval (relay-latency floor)
 
     let lastStat = 0;
     let pending = null;                    // next APDU already fetched by a grouped send-recv
