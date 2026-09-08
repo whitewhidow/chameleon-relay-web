@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-09c modeA-only';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-09e modeA-stable';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
