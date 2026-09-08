@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08t hce-mode+relaylog';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08u stall-diagnosis';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -865,7 +865,17 @@ async function startRelay() {
         }
         // Graceful stall: stop cleanly instead of thrashing the boards forever.
         if (stallCount >= STALL_LIMIT) {
-          log(`=== relay stalled: ${stallCount} card responses with no progress — stopping cleanly. ${hceMode ? 'Phone/HCE session likely dropped (field or applet reset).' : 'Card decoupled, or (if a phone) try HCE mode.'} ===`, 'err');
+          log(`=== relay stalled: ${stallCount} card responses with no progress — stopping. ===`, 'err');
+          // Definitive present-vs-gone: try one full re-activation of the mole card.
+          try {
+            await M.relayStop();
+            const rc = await M.relayStart();
+            if (rc.status === ST.HF_TAG_OK)
+              log('DIAGNOSIS: card is STILL PRESENT (re-activation OK) → it answers RATS but ignores every APDU = applet DORMANT/silent, not decoupled. A phone wallet does this when its payment applet isn\'t live.', 'warn');
+            else
+              log('DIAGNOSIS: card is GONE (re-activation failed) → it physically decoupled / RF-deactivated mid-flow. Reposition/hold it steadier.', 'warn');
+            await M.relayStop();
+          } catch (_) {}
           break;   // -> finally releases both boards to normal
         }
       } else { emptyStreak = 0; stallCount = 0; }
