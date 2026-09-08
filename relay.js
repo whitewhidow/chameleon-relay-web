@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08f session-recovery';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08g writelock-reclone';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -288,7 +288,18 @@ class ChameleonBLE {
     return p;
   }
 
-  async _write(frame) {
+  // Serialize all writes to this device: Web Bluetooth allows only one writeValue
+  // in flight per characteristic, so concurrent sendCmd calls (e.g. the relay loop
+  // + a Clear-cache click) otherwise collide ("GATT operation already in progress")
+  // and time out. Chain every write so they go out one at a time.
+  _write(frame) {
+    this._writeChain = (this._writeChain || Promise.resolve())
+      .catch(() => {})
+      .then(() => this._writeRaw(frame));
+    return this._writeChain;
+  }
+
+  async _writeRaw(frame) {
     for (;;) {
       let sent = 0;
       try {
@@ -684,6 +695,7 @@ async function startRelay() {
     let lastStat = 0;
     let pending = null;                    // next APDU already fetched by a grouped send-recv
     let emptyStreak = 0;                   // consecutive empty relay results -> session recovery
+    let sawIdle = true;                    // idle since last APDU -> next APDU starts a new tap
     const EMPTY = new Uint8Array([0, 0]);  // resp_len 0 => pure blocking recv (send nothing)
     while (running) {
       // Mode B, withheld: don't emulate; re-arm the moment the card appears.
@@ -724,6 +736,7 @@ async function startRelay() {
               setLedUI('ghost', present ? 'green' : 'red'); setLedUI('mole', present ? 'green' : 'red');
             }
           }
+          sawIdle = true;   // no APDU this window -> the next one starts a new tap
           continue;   // the ~600ms block already paced us; no extra sleep
         }
         apdu = r0.data;
@@ -731,11 +744,16 @@ async function startRelay() {
       const wait = performance.now() - tWait0;   // ~0 if pre-fetched, else the block wait
       lastApduAt = Date.now();
 
-      if (startsWith(apdu, PPSE_HEAD)) {
+      // New tap = PPSE reaching us, OR the first APDU after an idle gap. The idle
+      // case matters with the cache ON: PPSE is served in-ISR from cache and never
+      // reaches the loop, so without this the mole session from the previous tap
+      // goes stale and later taps fail. Re-clone gives each tap a fresh session.
+      if (startsWith(apdu, PPSE_HEAD) || sawIdle) {
         log('--- new transaction (tap) --- re-opening mole session', 'ok');
         await cloneFromMole(M, slot);   // fresh card session for a fresh cryptogram
         apduCount = 0;
       }
+      sawIdle = false;
       setLedUI('ghost', 'blue'); setLedUI('mole', 'blue');
       const tGot = performance.now();
       let rr;
