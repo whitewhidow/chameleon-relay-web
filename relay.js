@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08d cache-modes';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08e cache-dedupe-session';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -160,7 +160,9 @@ async function buildStaticCache(M) {
   const fci = await rly(PPSE);
   if (!(fci.length > 2)) { log('cache: PPSE relay failed — skipping cache', 'warn'); return pairs; }
   pairs.push({ cmd: PPSE, resp: fci });
-  const aids = parseAids(fci);
+  // dedupe AIDs (a PPSE can list the same AID twice) so we don't waste cache slots
+  const seenAid = new Set();
+  const aids = parseAids(fci).filter(a => { const h = hxc(a); if (seenAid.has(h)) return false; seenAid.add(h); return true; });
   log(`cache: PPSE ${fci.length}B, AIDs ${aids.map(a => hxc(a)).join(', ')}`);
   for (const aid of aids) {
     const sel = concat(u8([0x00, 0xa4, 0x04, 0x00, aid.length]), aid, u8([0x00]));
@@ -607,6 +609,10 @@ async function cloneFromMole(M, slot) {
     let p;
     try { p = await M.cardProbe(true); } catch (_) { await sleep(300); continue; }
     if (p.status === ST.HF_TAG_OK) {
+      // Close any session left open by a previous tap before re-opening, or the
+      // stale session wedges the RC522 and the new relayStart fails (later taps
+      // stop working). Guarded no-op on the firmware side if nothing is open.
+      try { await M.relayStop(); } catch (_) {}
       const r = await M.relayStart();
       if (r.status === ST.HF_TAG_OK && r.parsed && r.parsed.ats.length) return r.parsed;
     } else {
