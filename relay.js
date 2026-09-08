@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-09g cleanup+halt';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-09h leds';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -637,12 +637,11 @@ async function toggleConnect(who) {
     await dev.connect();
     log(`${who.toUpperCase()} connected: fw ${dev.fw} git ${dev.git}`, 'ok');
     if (dev.fw && !dev.fw.startsWith('99')) log(`warning: ${who} fw is ${dev.fw}, expected 99.x relay firmware`, 'warn');
-    // Both boards advertise as "ChameleonUltra" and are indistinguishable in the
-    // chooser — light a distinct colour so you know which physical unit is which.
-    // (Transient identify only; real red/green status takes over once relaying.)
-    const idColor = who === 'ghost' ? 3 : 2;       // ghost=RED, mole=BLUE
-    try { await dev.setLed(idColor); } catch (_) {}
-    setLedUI(who, who === 'ghost' ? 'red' : 'blue');
+    // Connected + idle (no relay running) = AMBER on both boards. The relay
+    // states (green = card responding, red = no card, blue = relaying) take over
+    // once you Start, and it returns to amber on Stop.
+    try { await dev.setLed(5); } catch (_) {}       // 5 = amber (idle)
+    setLedUI(who, 'amber');
     log(`${who.toUpperCase()} is the board now showing ${who === 'ghost' ? 'RED' : 'BLUE'} — ` +
         `place the ${who === 'ghost' ? 'RED (ghost) at the terminal/phone' : 'BLUE (mole) at the card'}.`, 'ok');
     setDevUI(who, dev);
@@ -770,6 +769,7 @@ async function startRelay() {
     // driven by the phone) to the LAST (phone finished reading). Logged when the
     // tap goes idle. This is the real "first contact -> fully read" number.
     let tapT0 = null, tapN = 0, tapTlast = 0, lastHit = 0;   // lastHit: cache-serve count at prev tap end
+    let ghostHealth = 1;   // ghost board LED: 1=green (card responding), 3=red (mole not answering); armed green
     const EMPTY = new Uint8Array([0, 0]);  // resp_len 0 => pure blocking recv (send nothing)
     while (running) {
       // Clear-cache requested from the button: do it here, in the loop's own context
@@ -933,18 +933,25 @@ async function startRelay() {
       // round-trip, sendrecv = deliver response + on-device wait for the next APDU
       log(`     t: wait ${wait.toFixed(0)}ms · relay ${(tRelay - tGot).toFixed(0)}ms · sendrecv ${(tSend - tRelay).toFixed(0)}ms`);
       if (!resp.length) log('empty card response — terminal will likely abort this APDU', 'warn');
-      setLedUI('ghost', 'green'); setLedUI('mole', 'green');
+      // LED reflects the actual relay result: green = card responded, red = mole
+      // not answering (no card). Drive the ghost BOARD LED on TRANSITIONS only
+      // (after the response is already delivered) so it never churns the ghost
+      // channel per-APDU or delays a response.
+      const ok = rr.status === ST.HF_TAG_OK;
+      setLedUI('ghost', ok ? 'green' : 'red'); setLedUI('mole', ok ? 'green' : 'red');
+      const gh = ok ? 1 : 3;
+      if (gh !== ghostHealth) { ghost.setLed(gh).catch(() => {}); ghostHealth = gh; }
     }
   } catch (e) {
     log(`relay error: ${e.message || e}`, 'err');
   } finally {
     try { await M.relayStop(); } catch (_) {}
-    // Release the ghost too, or it's left armed on a solid-red LED: stop
-    // emulating (reader mode) and hand the LED back to the default animation,
-    // so BOTH boards return to regular on Stop.
+    // Stop emulating on the ghost, and set both boards back to AMBER (connected,
+    // idle) — the same state as right after connecting.
     try { await ghost.changeMode(true); } catch (_) {}
-    try { await ghost.setLed(0); } catch (_) {}
-    setLedUI('ghost', ''); setLedUI('mole', '');
+    try { await ghost.setLed(5); } catch (_) {}
+    try { if (mole && mole.connected) await mole.setLed(5); } catch (_) {}
+    setLedUI('ghost', 'amber'); setLedUI('mole', 'amber');
     releaseWakeLock();
     running = false;
     $('status').textContent = 'stopped';
