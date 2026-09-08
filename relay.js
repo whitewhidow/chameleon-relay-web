@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260908 full-trace';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260908 trace2';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -1731,19 +1731,24 @@ async function exportTrace() {
     exported: new Date().toISOString(), build: BUILD,
     note: 'ts = app_timer ticks @16384Hz (ms=ts/16.384). ghost.frames = reader<->ghost both directions on the ghost clock; mole.exchanges = mole<->card on the mole clock.',
   };
-  try {
-    if (ghost.connected) {
+  // Each board independently, so one failing never silently drops the other.
+  if (ghost.connected) {
+    try {
       const rx = await ghost.sendCmd(CMD.HF14A_4_RX_LOG, u8([0]), 3000);
       const tx = await ghost.sendCmd(CMD.HF14A_4_TX_LOG, u8([0]), 3000);
       const rxf = parseFrameLog(rx.data, true).map(f => ({ ...f, dir: 'reader->ghost' }));
       const txf = parseFrameLog(tx.data, false).map(f => ({ ...f, dir: 'ghost->reader' }));
       trace.ghost = { frames: [...rxf, ...txf].sort((a, b) => a.ts - b.ts) };
-    }
-    if (mole.connected) {
+      log(`trace: ghost ${rxf.length} RX + ${txf.length} TX frames`, 'ok');
+    } catch (e) { log('trace: ghost read FAILED: ' + (e.message || e), 'err'); trace.ghostError = String(e); }
+  } else { log('trace: ghost NOT connected — no reader↔ghost side', 'warn'); }
+  if (mole.connected) {
+    try {
       const rl = await mole.sendCmd(CMD.HF14A_4_RELAY_LOG, u8([0]), 3000);
       trace.mole = { exchanges: parseRelayLog(rl.data).sort((a, b) => a.ts - b.ts) };
-    }
-  } catch (e) { log('export trace read error: ' + e, 'err'); }
+      log(`trace: mole ${trace.mole.exchanges.length} APDU exchange(s)`, 'ok');
+    } catch (e) { log('trace: mole read FAILED: ' + (e.message || e), 'err'); trace.moleError = String(e); }
+  } else { log('trace: mole NOT connected — no card↔mole side (connect the mole for a full relay trace)', 'warn'); }
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const blob = new Blob([JSON.stringify(trace, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
