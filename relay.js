@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260908 rrp-split+sniff';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260908 sniff-loop';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -1581,7 +1581,9 @@ async function rrpPosTest() {
         if (!verdict) { log('POS went to READ RECORD after GPO with NO 80 EA — THIS POS does NOT use RRP', 'ok'); setRrpBadge('clear'); verdict = 'norrp'; }
         pending = hexToBytes('6A83');
       } else {
-        log('  ghost saw: ' + hex(apdu).trim());
+        // After a verdict the reader often brute-forces its whole AID list (our
+        // lure only answers 2 AIDs) — that's normal; log only before the verdict.
+        if (!verdict) log('  ghost saw: ' + hex(apdu).trim());
         pending = hexToBytes('6D00');
       }
     }
@@ -1627,14 +1629,21 @@ function sniffLabel(f, bits) {
   return { tag: '' };
 }
 
+let sniffRunning = false;
 async function passiveSniff() {
+  if (sniffRunning) { sniffRunning = false; log('stopping passive sniff…', 'warn'); return; }
   if (running || rrpTestRunning) { log('stop the current session first', 'warn'); return; }
   const dev = ghost.connected ? ghost : (mole.connected ? mole : null);
   if (!dev) { log('connect a board first (the one you place between the reader and card)', 'err'); return; }
   const who = dev.label.toUpperCase();
   const slot = parseInt($('slot').value, 10) || 1;
-  const WINDOW = 12000;
-  log(`=== PASSIVE SNIFF on the ${who} board — place it BETWEEN the reader and the card, then run the transaction. Listening ${WINDOW / 1000}s (reader→card only). ===`, 'ok');
+  // Each sniff call blocks the device; keep it WELL under the 4s BLE supervision
+  // timeout (a 12s block dropped the link) and loop for continuous coverage.
+  const WINDOW = 2000;
+  sniffRunning = true;
+  if ($('sniff-btn')) $('sniff-btn').textContent = 'Stop sniff';
+  log(`=== PASSIVE SNIFF on the ${who} board — place it BETWEEN the reader and the card and run the transaction. Looping ${WINDOW / 1000}s windows (reader→card only); click again to stop. ===`, 'ok');
+  let total = 0, rrp = false;
   try {
     await dev.setActiveSlot(slot);
     await dev.setSlotTagType(slot, TAG_HF14A_4);
@@ -1642,31 +1651,31 @@ async function passiveSniff() {
     try { await dev.setAntiColl({ uid: hexToBytes('DEADBEEF'), atqa: hexToBytes('0004'), sak: 0x20, ats: new Uint8Array(0) }); } catch (_) {}
     await dev.changeMode(false);            // emulator/listen mode: NFCT demodulates the field
     dev.setLed(2).catch(() => {});          // blue = sniffing
-    log(`sniffer armed on ${who}. Present the reader+card now…`, 'ok');
-    const r = await dev.sniff(WINDOW, true);
-    const buf = (r && r.data) ? r.data : new Uint8Array(0);
-    let i = 0, n = 0, rrp = false;
-    while (i + 2 <= buf.length) {
-      const hdr = (buf[i] << 8) | buf[i + 1]; i += 2;
-      const bits = hdr & 0x7fff, nb = Math.ceil(bits / 8);
-      if (i + nb > buf.length) break;
-      const f = buf.slice(i, i + nb); i += nb;
-      n++;
-      const lbl = sniffLabel(f, bits);
-      if (lbl.rrp) rrp = true;
-      log(`  sniff[${n}] ${bits}b ${hex(f).trim()}${lbl.tag ? '   ← ' + lbl.tag : ''}`, lbl.rrp ? 'warn' : undefined);
-    }
-    if (n === 0) log('sniff: no frames captured — no field in range, or the NFCT delivered nothing while unselected (the hardware limit we were testing).', 'warn');
-    else {
-      log(`=== PASSIVE SNIFF done: ${n} reader→card frame(s) ===`, 'ok');
-      if (rrp) { log('⚠ 80 EA present — the READER ran RRP with this card', 'warn'); setRrpBadge('enforced'); }
-      else { log('no 80 EA among the captured commands — reader did NOT run RRP (or the exchange never reached that step)', 'ok'); setRrpBadge('clear'); }
+    while (sniffRunning) {
+      let r;
+      try { r = await dev.sniff(WINDOW, true); }
+      catch (e) { log(`sniff window error: ${e.message || e} — retrying`, 'warn'); await sleep(200); continue; }
+      const buf = (r && r.data) ? r.data : new Uint8Array(0);
+      let i = 0;
+      while (i + 2 <= buf.length) {
+        const hdr = (buf[i] << 8) | buf[i + 1]; i += 2;
+        const bits = hdr & 0x7fff, nb = Math.ceil(bits / 8);
+        if (i + nb > buf.length) break;
+        const f = buf.slice(i, i + nb); i += nb;
+        total++;
+        const lbl = sniffLabel(f, bits);
+        if (lbl.rrp && !rrp) { rrp = true; setRrpBadge('enforced'); }
+        log(`  sniff ${bits}b ${hex(f).trim()}${lbl.tag ? '   ← ' + lbl.tag : ''}`, lbl.rrp ? 'warn' : undefined);
+      }
     }
   } catch (e) {
     log('passive sniff error: ' + e, 'err');
   } finally {
+    sniffRunning = false;
+    if ($('sniff-btn')) $('sniff-btn').textContent = 'Passive sniff';
     try { await dev.changeMode(true); } catch (_) {}
     dev.setLed(5).catch(() => {});
+    log(`=== PASSIVE SNIFF stopped: ${total} reader→card frame(s) total${rrp ? ' — 80 EA SEEN (reader ran RRP)' : (total ? ' — no 80 EA seen' : '')} ===`, 'ok');
   }
 }
 
