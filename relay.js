@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-07i rxdump';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08a clear-cache-on-start';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -38,6 +38,7 @@ const CMD = {
   HF14A_4_APDU_RECV: 6000,
   HF14A_4_APDU_SEND: 6001,
   HF14A_4_SET_ANTI_COLL: 6002,
+  HF14A_4_STATIC_RESP: 6003,      // add/clear static APDU response pairs (cmd_len 0 = clear)
   HF14A_4_RELAY_START: 6006,
   HF14A_4_RELAY_APDU: 6007,
   HF14A_4_RELAY_STOP: 6008,
@@ -240,6 +241,10 @@ class ChameleonBLE {
     const p = concat(u8([a.uid.length]), a.uid, a.atqa, u8([a.sak]), u8([a.ats.length]), a.ats);
     return this.sendCmd(CMD.HF14A_4_SET_ANTI_COLL, p);
   }
+  // Clear any static (cached) APDU responses on the active slot. The web app never
+  // sets them, but they are flash-backed and persist, so a stray cache (e.g. from a
+  // debug tool) would make the ghost answer from cache instead of relaying live.
+  clearStaticResponses() { return this.sendCmd(CMD.HF14A_4_STATIC_RESP, u8([0])); }
   apduRecv() { return this.sendCmd(CMD.HF14A_4_APDU_RECV, new Uint8Array(0), 2500); }
   apduSend(resp) { return this.sendCmd(CMD.HF14A_4_APDU_SEND, concat(u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp)); }
   // Grouped: deliver `resp` (may be empty = pure blocking recv) AND wait on-device
@@ -479,6 +484,7 @@ async function armGhost(anti, slot) {
   await ghost.setActiveSlot(slot);
   await ghost.setSlotTagType(slot, TAG_HF14A_4);
   await ghost.setSlotEnable(slot, SENSE_HF, true);
+  try { await ghost.clearStaticResponses(); } catch (e) {}  // safety: never serve a stale cache
   await ghost.setAntiColl(anti);   // anti-coll BEFORE emulator mode
   await ghost.changeMode(false);   // tag / emulator mode
 }
