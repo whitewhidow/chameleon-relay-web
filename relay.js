@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08k rrp-readout';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08l rrp-aip-bit';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -982,7 +982,8 @@ async function checkRRP() {
     if (!sw9000(await rly(sel))) { log(`RRP: ${hxc(aid)} SELECT failed`, 'warn'); continue; }
     const gr = await rly(hexToBytes('80A8000002830000'));
     const aip = tlvFind(gr, 0x82)[0];
-    const aipBit = aip && aip.length >= 1 ? !!(aip[0] & 0x01) : null;   // M/Chip AIP b1b1 (best-effort)
+    // Relay-Resistance-Supported is AIP BYTE 2, bit 1 (0x01): e.g. 1981=RRP, 1980=no.
+    const aipBit = aip && aip.length >= 2 ? !!(aip[1] & 0x01) : null;
     // Probe: EXCHANGE RELAY RESISTANCE DATA, 4-byte terminal entropy
     const rrp = await rly(hexToBytes('80EA000004AABBCCDD00'));
     const supported = rrp.length > 2 && sw9000(rrp);   // real RRP response vs error SW
