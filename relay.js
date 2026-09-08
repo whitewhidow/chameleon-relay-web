@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08p reader-export';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08q conn-interval-log';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -43,6 +43,7 @@ const CMD = {
   HF14A_4_RELAY_APDU: 6007,
   HF14A_4_RELAY_STOP: 6008,
   HF14A_4_RX_LOG: 6009,           // diagnostic: raw reader frames the ghost received
+  HF14A_4_CONN_PARAMS: 6010,      // diagnostic: negotiated BLE conn params (relay latency)
   HF14A_4_SET_LED: 6010,
   HF14A_4_CARD_PROBE: 6011,
   HF14A_4_APDU_SEND_RECV: 6012,   // send response AND block for next APDU (grouped)
@@ -364,6 +365,19 @@ class ChameleonBLE {
   }
   relayApdu(apdu) { return this.sendCmd(CMD.HF14A_4_RELAY_APDU, apdu, 3500); }
   relayStop() { return this.sendCmd(CMD.HF14A_4_RELAY_STOP, new Uint8Array(0), 2500); }
+  // Negotiated BLE connection params (relay-latency diagnostic). Returns ms, or
+  // null if unsupported (older firmware) / never connected. interval is what
+  // gates per-APDU latency; the central (browser/OS) chooses it, not us.
+  async connParams() {
+    try {
+      const r = await this.sendCmd(CMD.HF14A_4_CONN_PARAMS, new Uint8Array(0), 2000);
+      if (!r.data || r.data.length < 8) return null;
+      const be = (i) => (r.data[i] << 8) | r.data[i + 1];
+      const mx = be(2);
+      if (!mx) return null;                    // 0 = never connected
+      return { minMs: be(0) * 1.25, maxMs: mx * 1.25, latency: be(4), timeoutMs: be(6) * 10 };
+    } catch (_) { return null; }               // command unknown on old firmware
+  }
   cardProbe(force) { return this.sendCmd(CMD.HF14A_4_CARD_PROBE, u8([force ? 1 : 0]), 2500); }
   setLed(state) { return this.sendCmd(CMD.HF14A_4_SET_LED, u8([state & 0xff])); }
 }
@@ -700,6 +714,7 @@ async function startRelay() {
     ghost.setLed(1).catch(() => {}); setLedUI('ghost', 'green'); setLedUI('mole', 'green');
     if (gate) log('MODE B: ghost withholds emulation until board2 has the card.', 'ok');
     log('relay loop running — tap the terminal/phone on board1.', 'ok');
+    logConnParams();   // report the negotiated BLE interval (relay-latency floor)
 
     let lastStat = 0;
     let pending = null;                    // next APDU already fetched by a grouped send-recv
@@ -1134,6 +1149,17 @@ function noteReader() {
   const hit = loadReaders().find(x => x.fp === fp);
   if (hit) { recognisedThisRun = true; log(`recognised reader: "${hit.name}" (${rrpLabel(hit.rrp)}, seen ${hit.seen}×) — ${readerSummary(curTermData)}`, 'ok'); }
   else { recognisedThisRun = true; log(`new reader fingerprint — ${readerSummary(curTermData)} (saved on Stop)`, 'ok'); }
+}
+// Log each board's negotiated BLE interval so we can see the real relay-latency
+// floor (and whether a native app forcing CONNECTION_PRIORITY_HIGH would help).
+async function logConnParams() {
+  for (const [name, b] of [['ghost', ghost], ['mole', mole]]) {
+    if (!b || typeof b.connParams !== 'function') continue;
+    const p = await b.connParams();
+    if (!p) { log(`${name} BLE interval: unknown (old firmware or remote board)`, 'warn'); continue; }
+    const near = p.maxMs <= 16;
+    log(`${name} BLE interval: ${p.minMs.toFixed(2)}–${p.maxMs.toFixed(2)} ms (latency ${p.latency}, timeout ${p.timeoutMs} ms) — ${near ? 'already near the 7.5–15 ms floor; a native app would NOT help' : 'THROTTLED above 15 ms; a native app (CONNECTION_PRIORITY_HIGH) would help'}`, near ? 'ok' : 'warn');
+  }
 }
 function unhexTags(t) { const o = {}; for (const k in (t || {})) o[k] = hexToBytes(t[k]); return o; }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
