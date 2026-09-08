@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08r conn-interval-fix';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08s setled-id-fix';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -43,7 +43,7 @@ const CMD = {
   HF14A_4_RELAY_APDU: 6007,
   HF14A_4_RELAY_STOP: 6008,
   HF14A_4_RX_LOG: 6009,           // diagnostic: raw reader frames the ghost received
-  HF14A_4_CONN_PARAMS: 6010,      // diagnostic: negotiated BLE conn params (relay latency)
+  HF14A_4_CONN_PARAMS: 6013,      // diagnostic: negotiated BLE conn params (relay latency)
   HF14A_4_SET_LED: 6010,
   HF14A_4_CARD_PROBE: 6011,
   HF14A_4_APDU_SEND_RECV: 6012,   // send response AND block for next APDU (grouped)
