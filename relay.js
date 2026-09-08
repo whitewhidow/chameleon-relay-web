@@ -1099,7 +1099,9 @@ async function dumpRxLog() {
 }
 
 async function clearCache() {
-  if (!ghost.connected) { log('connect the ghost board first', 'warn'); return; }
+  // Also drop the saved RRP POS-test lure so it rebuilds from the card next time.
+  try { if (localStorage.getItem(RRP_PROFILE_KEY)) { localStorage.removeItem(RRP_PROFILE_KEY); log('saved RRP lure cleared — the next RRP POS test will rebuild it from the card on the mole', 'ok'); } } catch (_) {}
+  if (!ghost.connected) { log('ghost not connected — saved RRP lure cleared; connect the ghost to also wipe its on-device cache', 'warn'); return; }
   // While the relay loop runs it monopolises the ghost BLE channel; a concurrent
   // clear collides/times out. Hand it to the loop, which clears at the next gap.
   if (running) {
