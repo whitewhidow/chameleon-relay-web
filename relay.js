@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08m genac-latency-test';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08n rrp-reader-badge';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -461,6 +461,7 @@ function releaseWakeLock() { try { if (wakeLock) { wakeLock.release(); wakeLock 
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && running && !wakeLock) acquireWakeLock(); });
 let running = false;
 let apduCount = 0;
+let rrpSeenThisRun = false;              // did the terminal send 80 EA (RRP) this session?
 let cacheCount = 0;                      // static entries currently in the ghost (host's view)
 const cachedCmds = new Set();           // hex of cmds cached this session (dedupe on pre-fill load)
 let clearRequested = false;             // Clear-cache asked while the relay loop is running
@@ -473,6 +474,15 @@ function setCacheStatus(note) {
   el.style.color = cacheCount > 0 ? 'var(--green)' : 'var(--muted)';
 }
 function cacheReset() { cacheCount = 0; cachedCmds.clear(); setCacheStatus(); }
+
+// Prominent RRP badge so a reader's relay-resistance is visible without scrolling.
+function setRrpBadge(state) {
+  const el = $('rrp-badge'); if (!el) return;
+  if (state === 'enforced') { el.textContent = '⚠ READER ENFORCES RRP'; el.style.display = ''; el.style.background = '#5a1a1a'; el.style.color = '#ff9a9a'; }
+  else if (state === 'watch') { el.textContent = 'RRP: watching…'; el.style.display = ''; el.style.background = '#23272f'; el.style.color = '#9aa2ad'; }
+  else if (state === 'clear') { el.textContent = '✓ no RRP seen'; el.style.display = ''; el.style.background = '#153015'; el.style.color = '#8fe08f'; }
+  else { el.style.display = 'none'; }
+}
 
 function log(msg, cls) {
   const el = $('log');
@@ -639,7 +649,7 @@ async function startRelay() {
   // mole-facing side: the local board (Local mode) or the remote mole over WS (Ghost mode)
   const M = (role === 'ghost') ? wsLink.mole : mole;
   if (role === 'ghost' && !wsLink.connected) { log('not connected to the relay server', 'err'); return; }
-  running = true; apduCount = 0;
+  running = true; apduCount = 0; rrpSeenThisRun = false; setRrpBadge('watch');
   acquireWakeLock();
   updateStartEnabled();
   const mode = document.querySelector('input[name=mode]:checked').value;
@@ -770,7 +780,8 @@ async function startRelay() {
       // Terminal RRP enforcement: EXCHANGE RELAY RESISTANCE DATA (80 EA). If the
       // reader sends this, it is time-checking the relay (distance bounding).
       if (apdu.length >= 2 && apdu[0] === 0x80 && apdu[1] === 0xEA) {
-        log('⚠ terminal sent EXCHANGE RELAY RESISTANCE DATA (80 EA) — this reader ENFORCES RRP; the relay is being time-checked', 'warn');
+        if (!rrpSeenThisRun) log('⚠ terminal sent EXCHANGE RELAY RESISTANCE DATA (80 EA) — this reader ENFORCES RRP; the relay is being time-checked', 'warn');
+        rrpSeenThisRun = true; setRrpBadge('enforced');
       }
       setLedUI('ghost', 'blue'); setLedUI('mole', 'blue');
       const tGot = performance.now();
@@ -920,7 +931,21 @@ async function moleServeClone() {
   return null;
 }
 
-function stopRelay() { running = false; }
+function stopRelay() {
+  running = false;
+  // Reader-RRP verdict for the session just ended (only meaningful if you relayed an
+  // RRP-ADVERTISING card, e.g. the Mastercard — a card that doesn't advertise RRP will
+  // never make the reader send 80 EA).
+  if (rrpSeenThisRun) {
+    log('=== RRP VERDICT: this reader ENFORCED RRP (saw 80 EA) — relay would be time-rejected ===', 'warn');
+    setRrpBadge('enforced');
+  } else if (apduCount > 0) {
+    log('=== RRP VERDICT: no 80 EA seen this session. Reader did NOT run RRP — but only conclusive if you relayed an RRP-advertising card (Mastercard) and the flow reached GPO ===', 'ok');
+    setRrpBadge('clear');
+  } else {
+    setRrpBadge('none');
+  }
+}
 
 // Diagnostic: dump the raw reader frames the ghost captured (cmd 6009), so we can
 // see exactly how a given reader (Flipper, phone, POS) frames its T=CL commands.
