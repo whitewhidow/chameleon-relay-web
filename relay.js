@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08i cache-off-or-oncardenter';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08j cleanup';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -637,7 +637,7 @@ async function startRelay() {
   const mode = document.querySelector('input[name=mode]:checked').value;
   const gate = (mode === 'B');
   const slot = parseInt($('slot').value, 10) || 1;
-  const cacheMode = ($('cache') && $('cache').value) || 'off';   // 'off' | 'prefill' | 'learn'
+  const cacheMode = ($('cache') && $('cache').value) || 'off';   // 'off' | 'prefill'
   // Adaptive poll: tight while a transaction is live (the phone is WTX-stalled
   // waiting on us, so every ms of poll gap is added latency), relaxed when idle
   // to spare BLE/CPU/battery. Safe on a slow link: the transport is strictly
