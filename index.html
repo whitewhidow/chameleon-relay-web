@@ -102,9 +102,8 @@
     <div class="grp"><label>Slot <input type="number" id="slot" value="1" min="1" max="8"></label></div>
     <div class="grp"><label title="Cache static EMV responses so taps are fast. pre-fill = read the card at Start (fast first tap, small Start delay). learn = fill from live taps (no Start delay, first tap slow, then fast). Dynamic APDUs (GENERATE AC) always relay live.">Cache
       <select id="cache">
-        <option value="off" selected>off</option>
-        <option value="prefill">pre-fill at Start</option>
-        <option value="learn">learn from taps</option>
+        <option value="off" selected>off (live relay)</option>
+        <option value="prefill">on card enter (fast, single-AID)</option>
       </select></label>
       <span id="cache-status" style="color:var(--muted);font-size:12px">cache: empty</span>
     </div>
@@ -131,6 +130,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260908g"></script>
+<script src="relay.js?v=20260908i"></script>
 </body>
 </html>
