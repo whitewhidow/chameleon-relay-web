@@ -117,6 +117,7 @@
     <button id="clearcache-btn" title="Wipe the ghost's cached static responses (e.g. before a different card). Needs the ghost connected.">Clear cache</button>
     <button id="rrp-btn" title="Diagnostic (your own card): read each AID's AIP relay-resistance bit and probe EXCHANGE RELAY RESISTANCE DATA (80 EA) to see if the card is relay-hardened. Card on the mole, relay stopped.">Check RRP</button>
     <button id="genac-btn" title="Diagnostic (your own card): run PPSE→SELECT→GPO→READ→GENERATE AC with synthetic terminal data and time GENERATE AC (+full round-trip estimate). Latency measurement only — the cryptogram is never submitted. Card on the mole, relay stopped.">Test payment</button>
+    <button id="rrptest-btn" title="Does a POS actually USE relay resistance? The ghost emulates a card that ADVERTISES RRP (built once from your card on the mole, GPO AIP forced on, then saved). Tap the ghost on the POS: if the POS sends 80 EA it USES RRP; if it goes straight to READ RECORD it does NOT. Your phone (no RRP kernel) will read 'does NOT'. Ghost connected; take it to the POS.">RRP POS test</button>
     <button id="cachesafe-btn" title="Diagnostic (your own card, mole-direct, no POS): proves GPO is state-critical — a live GPO yields a cryptogram but a cached/skipped GPO makes GENERATE AC fail. Shows why caching GPO breaks a real-POS payment. Card on the mole, relay stopped.">Test cache-safety</button>
     <button id="readers-btn" title="Show the stored list of readers you've relayed against, each with its RRP verdict and captured terminal fingerprint. Readers with a fingerprint auto-recognise on the next relay.">Readers</button>
     <button id="export-btn" title="Download the stored reader list and the current log as one timestamped JSON file.">Export</button>
@@ -135,6 +136,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260909h"></script>
+<script src="relay.js?v=20260908rrp"></script>
 </body>
 </html>

