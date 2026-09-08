@@ -47,6 +47,7 @@ const CMD = {
   HF14A_4_SET_LED: 6010,
   HF14A_4_CARD_PROBE: 6011,
   HF14A_4_APDU_SEND_RECV: 6012,   // send response AND block for next APDU (grouped)
+  HF14A_SNIFF: 2020,              // passive HF-14A sniff (reader->card frames)
 };
 // status codes: HF_TAG_OK=0, HF_TAG_NO=1, STATUS_SUCCESS=104 (apdu_recv uses SUCCESS)
 const ST = { HF_TAG_OK: 0, HF_TAG_NO: 1, SUCCESS: 104 };
@@ -383,6 +384,12 @@ class ChameleonBLE {
     }
     await flush();
     return loaded;
+  }
+  // Passive HF-14A sniff: block on-device for `timeoutMs` capturing reader->card
+  // frames (passive=1 => stay silent, don't respond). Returns the trace buffer.
+  sniff(timeoutMs, passive) {
+    const t = Math.min(Math.max(timeoutMs | 0, 1000), 30000);
+    return this.sendCmd(CMD.HF14A_SNIFF, u8([(t >> 8) & 0xff, t & 0xff, passive ? 1 : 0]), t + 3000);
   }
   apduRecv() { return this.sendCmd(CMD.HF14A_4_APDU_RECV, new Uint8Array(0), 2500); }
   apduSend(resp) { return this.sendCmd(CMD.HF14A_4_APDU_SEND, concat(u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp)); }
@@ -1521,29 +1528,32 @@ function loadRrpLure() {
              pairs: j.pairs.map(x => ({ cmd: hexToBytes(x.cmd), resp: hexToBytes(x.resp) })) }; } catch (_) { return null; }
 }
 
+// Build the RRP lure from your card on the MOLE (mole-only action). Saves to
+// localStorage; the ghost then serves it standalone in the RRP POS test.
+async function buildRrpLure() {
+  if (running || rrpTestRunning) { log('stop the current session first', 'warn'); return; }
+  if (!mole.connected) { log('connect the MOLE and put your card on it to build the lure', 'err'); return; }
+  log('Build RRP lure: reading your card on the mole — place the card…', 'warn');
+  await mole.changeMode(true);
+  let lure = null;
+  for (let i = 0; i < 40 && !lure; i++) {
+    try { if ((await mole.cardProbe(true)).status === ST.HF_TAG_OK) lure = await captureRrpLure(mole); } catch (_) {}
+    if (!lure) await sleep(300);
+  }
+  if (!lure) { log('could not read a card on the mole to build the lure', 'err'); return; }
+  saveRrpLure(lure);
+  log(`RRP lure built (${lure.pairs.length} responses; GPO AIP advertises RRP) and saved. Now connect the ghost and click "RRP POS test".`, 'ok');
+}
+
+// RRP POS test: arm the GHOST with the saved lure and watch for 80 EA (ghost-only).
 async function rrpPosTest() {
   if (rrpTestRunning) { rrpTestRunning = false; log('stopping RRP POS test…', 'warn'); return; }
   if (running) { log('stop the relay first', 'warn'); return; }
   if (!ghost.connected) { log('connect the GHOST board first (the one you tap on the POS)', 'err'); return; }
+  const lure = loadRrpLure();
+  if (!lure) { log('no saved lure — connect the MOLE + your card and click "Build RRP lure" first', 'err'); return; }
   const slot = parseInt($('slot').value, 10) || 1;
-
-  let lure = loadRrpLure();
-  if (lure) {
-    log(`RRP POS test: using saved lure card (${lure.pairs.length} responses). To rebuild, connect mole + card and clear site data.`, 'ok');
-  } else if (mole.connected) {
-    log('RRP POS test: no saved lure — building it once from your card on the mole. Place the card…', 'warn');
-    await mole.changeMode(true);
-    for (let i = 0; i < 40 && !lure; i++) {
-      try { if ((await mole.cardProbe(true)).status === ST.HF_TAG_OK) lure = await captureRrpLure(mole); } catch (_) {}
-      if (!lure) await sleep(300);
-    }
-    if (!lure) { log('could not read a card on the mole to build the lure', 'err'); return; }
-    saveRrpLure(lure);
-    log(`RRP POS test: lure built (${lure.pairs.length} responses; GPO AIP forced to advertise RRP) and saved. You can now use the ghost alone.`, 'ok');
-  } else {
-    log('RRP POS test: no saved lure and no mole. Connect mole + your card once to build the lure (it is then saved for ghost-only use).', 'err');
-    return;
-  }
+  log(`RRP POS test: using saved lure (${lure.pairs.length} responses).`, 'ok');
 
   rrpTestRunning = true;
   if ($('rrptest-btn')) $('rrptest-btn').textContent = 'Stop RRP test';
@@ -1586,6 +1596,80 @@ async function rrpPosTest() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// PASSIVE SNIFF (item 1): eavesdrop the reader->card command stream of a REAL
+// reader talking to a REAL card. Place the sniffer board between the reader and
+// the card, run a transaction, and every reader->card frame is logged — so you
+// can see whether a real POS actually issued 80 EA (RRP) with that card.
+// LIMIT: only the reader->card half is capturable (the NFCT can't demodulate a
+// real card's load-modulated replies) — so card responses never appear. Also,
+// whether the NFCT delivers the DATA frames (APDUs) while unselected is a
+// hardware unknown we are testing here; if only anticollision shows up, that is
+// the limitation, not a bug.
+function sniffLabel(f, bits) {
+  if (bits <= 8) {
+    if (f[0] === 0x26) return { tag: 'REQA' };
+    if (f[0] === 0x52) return { tag: 'WUPA' };
+    return { tag: '(short)' };
+  }
+  const pcb = f[0];
+  let a = f;                                  // strip a leading T=CL I-block PCB to reach the APDU
+  if ((pcb & 0xE0) === 0x00 && (pcb & 0x02)) a = f.slice(1);
+  if (a.length >= 2 && a[0] === 0x80 && a[1] === 0xEA) return { tag: '80 EA EXCHANGE RELAY RESISTANCE DATA — RRP!', rrp: true };
+  if (a.length >= 2 && a[0] === 0x00 && a[1] === 0xA4) return { tag: hex(f).includes('32 50 41 59 2E 53 59 53') ? 'SELECT PPSE' : 'SELECT AID' };
+  if (a.length >= 2 && a[0] === 0x80 && a[1] === 0xA8) return { tag: 'GPO' };
+  if (a.length >= 2 && a[0] === 0x00 && a[1] === 0xB2) return { tag: 'READ RECORD' };
+  if (a.length >= 2 && a[0] === 0x80 && a[1] === 0xCA) return { tag: 'GET DATA' };
+  if (pcb === 0x93 || pcb === 0x95 || pcb === 0x97) return { tag: 'anticoll/SELECT' };
+  if (pcb === 0xE0 || pcb === 0xE1) return { tag: 'RATS' };
+  if ((pcb & 0xF0) === 0xA0 || (pcb & 0xF0) === 0xB0) return { tag: 'R-block' };
+  if ((pcb & 0xC0) === 0xC0) return { tag: 'S-block (WTX/DESELECT)' };
+  return { tag: '' };
+}
+
+async function passiveSniff() {
+  if (running || rrpTestRunning) { log('stop the current session first', 'warn'); return; }
+  const dev = ghost.connected ? ghost : (mole.connected ? mole : null);
+  if (!dev) { log('connect a board first (the one you place between the reader and card)', 'err'); return; }
+  const who = dev.label.toUpperCase();
+  const slot = parseInt($('slot').value, 10) || 1;
+  const WINDOW = 12000;
+  log(`=== PASSIVE SNIFF on the ${who} board — place it BETWEEN the reader and the card, then run the transaction. Listening ${WINDOW / 1000}s (reader→card only). ===`, 'ok');
+  try {
+    await dev.setActiveSlot(slot);
+    await dev.setSlotTagType(slot, TAG_HF14A_4);
+    await dev.setSlotEnable(slot, SENSE_HF, true);
+    try { await dev.setAntiColl({ uid: hexToBytes('DEADBEEF'), atqa: hexToBytes('0004'), sak: 0x20, ats: new Uint8Array(0) }); } catch (_) {}
+    await dev.changeMode(false);            // emulator/listen mode: NFCT demodulates the field
+    dev.setLed(2).catch(() => {});          // blue = sniffing
+    log(`sniffer armed on ${who}. Present the reader+card now…`, 'ok');
+    const r = await dev.sniff(WINDOW, true);
+    const buf = (r && r.data) ? r.data : new Uint8Array(0);
+    let i = 0, n = 0, rrp = false;
+    while (i + 2 <= buf.length) {
+      const hdr = (buf[i] << 8) | buf[i + 1]; i += 2;
+      const bits = hdr & 0x7fff, nb = Math.ceil(bits / 8);
+      if (i + nb > buf.length) break;
+      const f = buf.slice(i, i + nb); i += nb;
+      n++;
+      const lbl = sniffLabel(f, bits);
+      if (lbl.rrp) rrp = true;
+      log(`  sniff[${n}] ${bits}b ${hex(f).trim()}${lbl.tag ? '   ← ' + lbl.tag : ''}`, lbl.rrp ? 'warn' : undefined);
+    }
+    if (n === 0) log('sniff: no frames captured — no field in range, or the NFCT delivered nothing while unselected (the hardware limit we were testing).', 'warn');
+    else {
+      log(`=== PASSIVE SNIFF done: ${n} reader→card frame(s) ===`, 'ok');
+      if (rrp) { log('⚠ 80 EA present — the READER ran RRP with this card', 'warn'); setRrpBadge('enforced'); }
+      else { log('no 80 EA among the captured commands — reader did NOT run RRP (or the exchange never reached that step)', 'ok'); setRrpBadge('clear'); }
+    }
+  } catch (e) {
+    log('passive sniff error: ' + e, 'err');
+  } finally {
+    try { await dev.changeMode(true); } catch (_) {}
+    dev.setLed(5).catch(() => {});
+  }
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   if (!navigator.bluetooth) {
     log('Web Bluetooth is not available in this browser. Use desktop or Android Chrome/Edge (not iOS Safari).', 'err');
@@ -1599,7 +1683,9 @@ window.addEventListener('DOMContentLoaded', () => {
   $('rxdump-btn').onclick = dumpRxLog;
   $('clearcache-btn').onclick = clearCache;
   if ($('rrp-btn')) $('rrp-btn').onclick = checkRRP;
+  if ($('lure-btn')) $('lure-btn').onclick = buildRrpLure;
   if ($('rrptest-btn')) $('rrptest-btn').onclick = rrpPosTest;
+  if ($('sniff-btn')) $('sniff-btn').onclick = passiveSniff;
   if ($('genac-btn')) $('genac-btn').onclick = testPayment;
   if ($('cachesafe-btn')) $('cachesafe-btn').onclick = testCacheSafety;
   if ($('readers-btn')) $('readers-btn').onclick = toggleReaders;
