@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08o reader-list';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08p reader-export';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -1170,6 +1170,20 @@ function renameReader(id) {
 function deleteReader(id) {
   const list = loadReaders().filter(x => x.id !== id); saveReaders(list); renderReaders();
 }
+// Download the stored reader list + the on-screen log as one timestamped JSON.
+function exportData() {
+  const logLines = Array.from($('log').children).map(n => n.textContent);
+  const readers = loadReaders();
+  const bundle = { exported: new Date().toISOString(), build: BUILD, readers, log: logLines };
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `chameleon-relay-${stamp}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  log(`exported ${readers.length} reader(s) + ${logLines.length} log line(s) → ${a.download}`, 'ok');
+}
 
 // Payment-flow latency test on YOUR OWN card (mole-driven, no POS). Runs
 // PPSE->SELECT->GPO->READ->GENERATE AC with synthetic terminal data and times
@@ -1292,6 +1306,7 @@ window.addEventListener('DOMContentLoaded', () => {
   if ($('rrp-btn')) $('rrp-btn').onclick = checkRRP;
   if ($('genac-btn')) $('genac-btn').onclick = testPayment;
   if ($('readers-btn')) $('readers-btn').onclick = toggleReaders;
+  if ($('export-btn')) $('export-btn').onclick = exportData;
   if ($('readers-panel')) $('readers-panel').addEventListener('click', e => {
     const b = e.target.closest('button'); if (!b) return;
     if (b.classList.contains('rdr-rename')) renameReader(b.dataset.id);
