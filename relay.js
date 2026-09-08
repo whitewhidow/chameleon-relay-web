@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08x batch-load+bench';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08y cycle-timer';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -739,6 +739,7 @@ async function startRelay() {
     const anti = await cloneFromMole(M, slot);
     if (!anti) { return; }            // stopped while waiting
     log(`cloned card UID=${hex(anti.uid)} ATQA=${hex(anti.atqa)} SAK=${anti.sak.toString(16)} ATS=${hex(anti.ats)}`, 'ok');
+    const cardTouchT = performance.now();   // first card touch (mole read the card)
 
     let staticPairs = null;
     if (cacheMode === 'prefill') {
@@ -759,6 +760,10 @@ async function startRelay() {
     if (hceMode) log('HCE/phone-card mode: single continuous session, no re-clone/recovery.', 'ok');
     let sawIdle = true;                    // idle since last APDU -> next APDU starts a new tap
     let lastRx = -1;                       // ghost RF-frame counter (cached-tap activity feedback)
+    // Transaction cycle timer: wall time from the FIRST APDU of a tap (card first
+    // driven by the phone) to the LAST (phone finished reading). Logged when the
+    // tap goes idle. This is the real "first contact -> fully read" number.
+    let tapT0 = null, tapN = 0, tapTlast = 0;
     const EMPTY = new Uint8Array([0, 0]);  // resp_len 0 => pure blocking recv (send nothing)
     while (running) {
       // Clear-cache requested from the button: do it here, in the loop's own context
@@ -792,6 +797,12 @@ async function startRelay() {
         let r0;
         try { r0 = await ghost.apduSendRecv(EMPTY); } catch (_) { await sleep(pollDelay()); continue; }
         if (r0.status !== ST.SUCCESS) {
+          // Tap just ended -> report BOTH cycle spans.
+          if (tapT0 !== null && tapN > 0) {
+            const cache = cacheMode === 'prefill' ? 'cache ON' : 'cache OFF';
+            log(`=== transaction cycle (${cache}, ${tapN} APDUs): ghost↔phone ${(tapTlast - tapT0).toFixed(0)} ms (first phone command → last) · from first card touch ${(tapTlast - cardTouchT).toFixed(0)} ms (incl. the place-card→tap-phone gap) ===`, 'ok');
+            tapT0 = null; tapN = 0;
+          }
           // idle (no APDU within the on-device block): mirror LED / Mode B disarm
           const now = Date.now();
           if (now - lastStat > 1000) {
@@ -824,6 +835,8 @@ async function startRelay() {
       }
       const wait = performance.now() - tWait0;   // ~0 if pre-fetched, else the block wait
       lastApduAt = Date.now();
+      if (tapT0 === null) tapT0 = performance.now();   // first phone command of this tap
+      tapN++;
 
       // New tap = PPSE reaching us, OR the first APDU after an idle gap. The idle
       // case matters with the cache ON: PPSE is served in-ISR from cache and never
@@ -920,6 +933,7 @@ async function startRelay() {
       // round-trip, sendrecv = deliver response + on-device wait for the next APDU
       log(`     t: wait ${wait.toFixed(0)}ms · relay ${(tRelay - tGot).toFixed(0)}ms · sendrecv ${(tSend - tRelay).toFixed(0)}ms`);
       if (!resp.length) log('empty card response — terminal will likely abort this APDU', 'warn');
+      tapTlast = tSend;   // last response delivered to the phone = "fully read" moment
       setLedUI('ghost', 'green'); setLedUI('mole', 'green');
     }
   } catch (e) {
