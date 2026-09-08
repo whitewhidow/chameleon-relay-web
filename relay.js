@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260908 sniff-loop';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260908 rrp-anyboard';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -662,23 +662,23 @@ async function safeProbe(dev) {
   catch (_) { return false; }
 }
 
-async function armGhost(anti, slot, staticPairs) {
-  await ghost.setActiveSlot(slot);
-  await ghost.setSlotTagType(slot, TAG_HF14A_4);
-  await ghost.setSlotEnable(slot, SENSE_HF, true);
-  try { await ghost.clearStaticResponses(); } catch (e) {}  // safety: never serve a stale cache
+async function armGhost(anti, slot, staticPairs, dev = ghost) {
+  await dev.setActiveSlot(slot);
+  await dev.setSlotTagType(slot, TAG_HF14A_4);
+  await dev.setSlotEnable(slot, SENSE_HF, true);
+  try { await dev.clearStaticResponses(); } catch (e) {}  // safety: never serve a stale cache
   cacheReset();
-  await ghost.setAntiColl(anti);   // anti-coll BEFORE emulator mode
+  await dev.setAntiColl(anti);   // anti-coll BEFORE emulator mode
   if (staticPairs && staticPairs.length) {
     let n = 0;
     // Batch-load: one (or few) frames instead of one round-trip per pair.
-    try { n = await ghost.addStaticResponseBatch(staticPairs); for (const p of staticPairs) cachedCmds.add(hxc(p.cmd)); }
+    try { n = await dev.addStaticResponseBatch(staticPairs); for (const p of staticPairs) cachedCmds.add(hxc(p.cmd)); }
     catch (e) { log('batch cache load failed, falling back to per-pair…', 'warn');
-      n = 0; for (const p of staticPairs) { try { await ghost.addStaticResponse(p.cmd, p.resp); n++; cachedCmds.add(hxc(p.cmd)); } catch (_) {} } }
+      n = 0; for (const p of staticPairs) { try { await dev.addStaticResponse(p.cmd, p.resp); n++; cachedCmds.add(hxc(p.cmd)); } catch (_) {} } }
     cacheCount = n; setCacheStatus('prefill');
-    log(`loaded ${n}/${staticPairs.length} cached responses into the ghost (batched)`, 'ok');
+    log(`loaded ${n}/${staticPairs.length} cached responses into the ${dev.label} (batched)`, 'ok');
   }
-  await ghost.changeMode(false);   // tag / emulator mode
+  await dev.changeMode(false);   // tag / emulator mode
 }
 
 async function cloneFromMole(M, slot) {
@@ -1531,41 +1531,43 @@ function loadRrpLure() {
 // Build the RRP lure from your card on the MOLE (mole-only action). Saves to
 // localStorage; the ghost then serves it standalone in the RRP POS test.
 async function buildRrpLure() {
-  if (running || rrpTestRunning) { log('stop the current session first', 'warn'); return; }
-  if (!mole.connected) { log('connect the MOLE and put your card on it to build the lure', 'err'); return; }
-  log('Build RRP lure: reading your card on the mole — place the card…', 'warn');
-  await mole.changeMode(true);
+  if (running || rrpTestRunning || sniffRunning) { log('stop the current session first', 'warn'); return; }
+  const dev = mole.connected ? mole : (ghost.connected ? ghost : null);   // whichever board is connected
+  if (!dev) { log('connect a board and put your card on it to build the lure', 'err'); return; }
+  log(`Build RRP lure: reading your card on the ${dev.label} — place the card…`, 'warn');
+  await dev.changeMode(true);   // reader mode
   let lure = null;
   for (let i = 0; i < 40 && !lure; i++) {
-    try { if ((await mole.cardProbe(true)).status === ST.HF_TAG_OK) lure = await captureRrpLure(mole); } catch (_) {}
+    try { if ((await dev.cardProbe(true)).status === ST.HF_TAG_OK) lure = await captureRrpLure(dev); } catch (_) {}
     if (!lure) await sleep(300);
   }
-  if (!lure) { log('could not read a card on the mole to build the lure', 'err'); return; }
+  if (!lure) { log('could not read a card to build the lure', 'err'); return; }
   saveRrpLure(lure);
-  log(`RRP lure built (${lure.pairs.length} responses; GPO AIP advertises RRP) and saved. Now connect the ghost and click "RRP POS test".`, 'ok');
+  log(`RRP lure built (${lure.pairs.length} responses; GPO AIP advertises RRP) and saved. Now click "RRP POS test" and tap on the POS.`, 'ok');
 }
 
 // RRP POS test: arm the GHOST with the saved lure and watch for 80 EA (ghost-only).
 async function rrpPosTest() {
   if (rrpTestRunning) { rrpTestRunning = false; log('stopping RRP POS test…', 'warn'); return; }
-  if (running) { log('stop the relay first', 'warn'); return; }
-  if (!ghost.connected) { log('connect the GHOST board first (the one you tap on the POS)', 'err'); return; }
+  if (running || sniffRunning) { log('stop the current session first', 'warn'); return; }
+  const dev = ghost.connected ? ghost : (mole.connected ? mole : null);   // whichever board is connected
+  if (!dev) { log('connect a board first (the one you tap on the POS)', 'err'); return; }
   const lure = loadRrpLure();
-  if (!lure) { log('no saved lure — connect the MOLE + your card and click "Build RRP lure" first', 'err'); return; }
+  if (!lure) { log('no saved lure — put your card on a connected board and click "Build RRP lure" first', 'err'); return; }
   const slot = parseInt($('slot').value, 10) || 1;
   log(`RRP POS test: using saved lure (${lure.pairs.length} responses).`, 'ok');
 
   rrpTestRunning = true;
   if ($('rrptest-btn')) $('rrptest-btn').textContent = 'Stop RRP test';
   setRrpBadge('watch');
-  log('=== RRP POS TEST armed: ghost is emulating an RRP-advertising card. TAP IT ON THE POS. ===', 'ok');
+  log(`=== RRP POS TEST armed: the ${dev.label} is emulating an RRP-advertising card. TAP IT ON THE POS. ===`, 'ok');
   try {
-    await armGhost(lure.anti, slot, lure.pairs);
-    ghost.setLed(1).catch(() => {});
+    await armGhost(lure.anti, slot, lure.pairs, dev);
+    dev.setLed(1).catch(() => {});
     const EMPTY = new Uint8Array(0);
     let pending = EMPTY, verdict = null, idle = 0;
     while (rrpTestRunning) {
-      let r; try { r = await ghost.apduSendRecv(pending, 600); } catch (_) { pending = EMPTY; continue; }
+      let r; try { r = await dev.apduSendRecv(pending, 600); } catch (_) { pending = EMPTY; continue; }
       pending = EMPTY;
       if (r.status !== ST.SUCCESS) {           // no APDU this window
         if (verdict && ++idle > 3) { log('— tap ended; tap again to re-test, or Stop —', 'ok'); verdict = null; idle = 0; setRrpBadge('watch'); }
@@ -1590,8 +1592,8 @@ async function rrpPosTest() {
   } catch (e) {
     log('RRP POS test error: ' + e, 'err');
   } finally {
-    try { await ghost.changeMode(true); } catch (_) {}
-    ghost.setLed(5).catch(() => {});
+    try { await dev.changeMode(true); } catch (_) {}
+    dev.setLed(5).catch(() => {});
     rrpTestRunning = false;
     if ($('rrptest-btn')) $('rrptest-btn').textContent = 'RRP POS test';
     log('=== RRP POS TEST stopped ===', 'ok');

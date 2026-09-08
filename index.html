@@ -117,8 +117,8 @@
     <button id="clearcache-btn" title="Wipe the ghost's cached static responses AND the saved RRP POS-test lure (so it rebuilds from the card next time). Ghost connection only needed to clear the on-device cache.">Clear cache</button>
     <button id="rrp-btn" title="Diagnostic (your own card): read each AID's AIP relay-resistance bit and probe EXCHANGE RELAY RESISTANCE DATA (80 EA) to see if the card is relay-hardened. Card on the mole, relay stopped.">Check RRP</button>
     <button id="genac-btn" title="Diagnostic (your own card): run PPSE→SELECT→GPO→READ→GENERATE AC with synthetic terminal data and time GENERATE AC (+full round-trip estimate). Latency measurement only — the cryptogram is never submitted. Card on the mole, relay stopped.">Test payment</button>
-    <button id="lure-btn" title="Step 1 (MOLE + your card only): read your card and build a lure that ADVERTISES RRP (PPSE/SELECT/GPO, GPO AIP forced on), saved locally. Do this once per card/browser.">Build RRP lure</button>
-    <button id="rrptest-btn" title="Step 2 (GHOST only): the ghost emulates the saved RRP-advertising lure. Tap it on a POS — if the POS sends 80 EA it USES RRP; if it goes straight to READ RECORD it does NOT. Your phone (no RRP kernel) reads 'does NOT'.">RRP POS test</button>
+    <button id="lure-btn" title="Step 1 (any one board + your card): read your card and build a lure that ADVERTISES RRP (PPSE/SELECT/GPO, GPO AIP forced on), saved locally. Do this once per card/browser.">Build RRP lure</button>
+    <button id="rrptest-btn" title="Step 2 (any one board): the board emulates the saved RRP-advertising lure. Tap it on a POS — if the POS sends 80 EA it USES RRP; if it goes straight to READ RECORD it does NOT. Your phone (no RRP kernel) reads 'does NOT'.">RRP POS test</button>
     <button id="sniff-btn" title="Passive sniff (one board): place it BETWEEN a real reader and a real card and run a transaction — logs every reader→card frame, so you can see if a real POS issued 80 EA (RRP). Reader→card only (the card's replies can't be heard on this hardware).">Passive sniff</button>
     <button id="cachesafe-btn" title="Diagnostic (your own card, mole-direct, no POS): proves GPO is state-critical — a live GPO yields a cryptogram but a cached/skipped GPO makes GENERATE AC fail. Shows why caching GPO breaks a real-POS payment. Card on the mole, relay stopped.">Test cache-safety</button>
     <button id="readers-btn" title="Show the stored list of readers you've relayed against, each with its RRP verdict and captured terminal fingerprint. Readers with a fingerprint auto-recognise on the next relay.">Readers</button>
@@ -138,6 +138,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260908sniff3"></script>
+<script src="relay.js?v=20260908anyboard"></script>
 </body>
 </html>
