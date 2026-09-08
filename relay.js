@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08e cache-dedupe-session';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08f session-recovery';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -321,7 +321,7 @@ class ChameleonBLE {
   // Clear any static (cached) APDU responses on the active slot. The web app never
   // sets them, but they are flash-backed and persist, so a stray cache (e.g. from a
   // debug tool) would make the ghost answer from cache instead of relaying live.
-  clearStaticResponses() { return this.sendCmd(CMD.HF14A_4_STATIC_RESP, u8([0])); }
+  clearStaticResponses() { return this.sendCmd(CMD.HF14A_4_STATIC_RESP, u8([0]), 3000); }
   // Load one cached cmd->resp pair: cmd_len(1) cmd(n) resp_len_be16(2) resp(m).
   addStaticResponse(cmd, resp) {
     const p = concat(u8([cmd.length]), cmd, u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp);
@@ -683,6 +683,7 @@ async function startRelay() {
 
     let lastStat = 0;
     let pending = null;                    // next APDU already fetched by a grouped send-recv
+    let emptyStreak = 0;                   // consecutive empty relay results -> session recovery
     const EMPTY = new Uint8Array([0, 0]);  // resp_len 0 => pure blocking recv (send nothing)
     while (running) {
       // Mode B, withheld: don't emulate; re-arm the moment the card appears.
@@ -742,6 +743,21 @@ async function startRelay() {
       catch (_) { rr = { status: ST.HF_TAG_NO, data: new Uint8Array(0) }; }
       const tRelay = performance.now();
       const resp = rr.status === ST.HF_TAG_OK ? rr.data : new Uint8Array(0);
+      // Session auto-recovery: if the card decouples mid-transaction the mole
+      // fast-fails (empty) on every APDU and a chatty reader loops forever. After a
+      // few consecutive empties, re-clone the mole session so it recovers the moment
+      // the card is back in contact instead of dead-looping.
+      if (rr.status !== ST.HF_TAG_OK) {
+        emptyStreak++;
+        if (emptyStreak === 3) {
+          log('mole giving empty responses — re-cloning session…', 'warn');
+          try { await M.relayStop(); } catch (_) {}
+          try {
+            const rc = await M.relayStart();
+            if (rc.status === ST.HF_TAG_OK) { log('mole session recovered', 'ok'); emptyStreak = 0; }
+          } catch (_) {}
+        }
+      } else emptyStreak = 0;
       // GROUPED: deliver the response AND fetch the next APDU in one round-trip.
       // The on-device wait for the phone's next command replaces the poll gap.
       let rg;
