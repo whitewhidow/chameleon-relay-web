@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08b hybrid-cache-toggle';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08c clear-cache-btn';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -857,6 +857,12 @@ async function dumpRxLog() {
   }
 }
 
+async function clearCache() {
+  if (!ghost.connected) { log('connect the ghost board first', 'warn'); return; }
+  try { await ghost.clearStaticResponses(); log('ghost static cache cleared (pure live relay until next cached Start)', 'ok'); }
+  catch (e) { log('clear cache failed: ' + (e.message || e), 'err'); }
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   if (!navigator.bluetooth) {
     log('Web Bluetooth is not available in this browser. Use desktop or Android Chrome/Edge (not iOS Safari).', 'err');
@@ -868,6 +874,7 @@ window.addEventListener('DOMContentLoaded', () => {
   $('stop').onclick = stopRelay;
   $('clear').onclick = () => { $('log').innerHTML = ''; };
   $('rxdump-btn').onclick = dumpRxLog;
+  $('clearcache-btn').onclick = clearCache;
   $('link-btn').onclick = toggleLink;
   $('wake-btn').onclick = wakeServer;
   document.querySelectorAll('input[name=role]').forEach(r => r.addEventListener('change', applyRole));
