@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260908 rrp-anyboard';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260908 full-trace';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -47,6 +47,8 @@ const CMD = {
   HF14A_4_SET_LED: 6010,
   HF14A_4_CARD_PROBE: 6011,
   HF14A_4_APDU_SEND_RECV: 6012,   // send response AND block for next APDU (grouped)
+  HF14A_4_RELAY_LOG: 6014,        // mole: relayed APDU + card response log (full trace)
+  HF14A_4_TX_LOG: 6016,           // ghost: emulator TX frames (ghost->reader) for full trace
   HF14A_SNIFF: 2020,              // passive HF-14A sniff (reader->card frames)
 };
 // status codes: HF_TAG_OK=0, HF_TAG_NO=1, STATUS_SUCCESS=104 (apdu_recv uses SUCCESS)
@@ -1681,6 +1683,78 @@ async function passiveSniff() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// FULL TRACE EXPORT: dump every direction for debugging, time-ordered.
+//   ghost RX_LOG (reader->ghost) + ghost TX_LOG (ghost->reader)  [same clock]
+//   mole RELAY_LOG (mole->card APDU + card->mole response)        [mole clock]
+// ts are app_timer ticks @16384 Hz (ms = ts/16.384). Ghost RX+TX share one clock
+// (mergeable); the mole log is a separate clock (aligned by sequence/content).
+// RX frame lengths are in BITS (incl CRC); TX frame lengths are in BYTES (pre-CRC).
+function parseFrameLog(d, lenIsBits) {
+  if (!d || d.length < 4) return [];
+  const head = d[1], entries = d[2], bytes = d[3];
+  const n = Math.min(d[0], entries);
+  const tsBase = 4 + entries * (1 + bytes);
+  const out = [];
+  for (let k = 0; k < n; k++) {
+    const idx = (head - n + k + entries) % entries;
+    const off = 4 + idx * (1 + bytes);
+    const raw = d[off];
+    const nb = Math.min(lenIsBits ? Math.round(raw / 8) : raw, bytes);
+    const frame = d.slice(off + 1, off + 1 + nb);
+    const t = (d[tsBase + idx * 4] | (d[tsBase + idx * 4 + 1] << 8) | (d[tsBase + idx * 4 + 2] << 16) | (d[tsBase + idx * 4 + 3] << 24)) >>> 0;
+    out.push({ ts: t, ms: +(t / 16.384).toFixed(1), hex: hex(frame).trim() });
+  }
+  return out;
+}
+function parseRelayLog(d) {
+  if (!d || d.length < 5) return [];
+  const head = d[1], entries = d[2], cw = d[3], rw = d[4];
+  const esz = 1 + cw + 1 + rw + 1;
+  const tsBase = 5 + entries * esz;
+  const n = Math.min(d[0], entries);
+  const out = [];
+  for (let k = 0; k < n; k++) {
+    const idx = (head - n + k + entries) % entries;
+    const off = 5 + idx * esz;
+    const clen = d[off], cmd = d.slice(off + 1, off + 1 + Math.min(clen, cw));
+    const rlen = d[off + 1 + cw], rsp = d.slice(off + 1 + cw + 1, off + 1 + cw + 1 + Math.min(rlen, rw));
+    const st = d[off + 1 + cw + 1 + rw];
+    const t = (d[tsBase + idx * 4] | (d[tsBase + idx * 4 + 1] << 8) | (d[tsBase + idx * 4 + 2] << 16) | (d[tsBase + idx * 4 + 3] << 24)) >>> 0;
+    out.push({ ts: t, ms: +(t / 16.384).toFixed(1), apdu: hex(cmd).trim(), resp: hex(rsp).trim(), st });
+  }
+  return out;
+}
+async function exportTrace() {
+  if (!ghost.connected && !mole.connected) { log('connect a board first', 'err'); return; }
+  const trace = {
+    exported: new Date().toISOString(), build: BUILD,
+    note: 'ts = app_timer ticks @16384Hz (ms=ts/16.384). ghost.frames = reader<->ghost both directions on the ghost clock; mole.exchanges = mole<->card on the mole clock.',
+  };
+  try {
+    if (ghost.connected) {
+      const rx = await ghost.sendCmd(CMD.HF14A_4_RX_LOG, u8([0]), 3000);
+      const tx = await ghost.sendCmd(CMD.HF14A_4_TX_LOG, u8([0]), 3000);
+      const rxf = parseFrameLog(rx.data, true).map(f => ({ ...f, dir: 'reader->ghost' }));
+      const txf = parseFrameLog(tx.data, false).map(f => ({ ...f, dir: 'ghost->reader' }));
+      trace.ghost = { frames: [...rxf, ...txf].sort((a, b) => a.ts - b.ts) };
+    }
+    if (mole.connected) {
+      const rl = await mole.sendCmd(CMD.HF14A_4_RELAY_LOG, u8([0]), 3000);
+      trace.mole = { exchanges: parseRelayLog(rl.data).sort((a, b) => a.ts - b.ts) };
+    }
+  } catch (e) { log('export trace read error: ' + e, 'err'); }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const blob = new Blob([JSON.stringify(trace, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `chameleon-trace-${stamp}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  const gc = trace.ghost ? trace.ghost.frames.length : 0, mc = trace.mole ? trace.mole.exchanges.length : 0;
+  log(`exported full trace: ${gc} ghost frames (reader↔ghost), ${mc} mole exchanges (mole↔card) → ${a.download}`, 'ok');
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   if (!navigator.bluetooth) {
     log('Web Bluetooth is not available in this browser. Use desktop or Android Chrome/Edge (not iOS Safari).', 'err');
@@ -1701,6 +1775,7 @@ window.addEventListener('DOMContentLoaded', () => {
   if ($('cachesafe-btn')) $('cachesafe-btn').onclick = testCacheSafety;
   if ($('readers-btn')) $('readers-btn').onclick = toggleReaders;
   if ($('export-btn')) $('export-btn').onclick = exportData;
+  if ($('trace-btn')) $('trace-btn').onclick = exportTrace;
   if ($('readers-panel')) $('readers-panel').addEventListener('click', e => {
     const b = e.target.closest('button'); if (!b) return;
     if (b.classList.contains('rdr-rename')) renameReader(b.dataset.id);

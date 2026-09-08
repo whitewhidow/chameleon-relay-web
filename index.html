@@ -123,6 +123,7 @@
     <button id="cachesafe-btn" title="Diagnostic (your own card, mole-direct, no POS): proves GPO is state-critical — a live GPO yields a cryptogram but a cached/skipped GPO makes GENERATE AC fail. Shows why caching GPO breaks a real-POS payment. Card on the mole, relay stopped.">Test cache-safety</button>
     <button id="readers-btn" title="Show the stored list of readers you've relayed against, each with its RRP verdict and captured terminal fingerprint. Readers with a fingerprint auto-recognise on the next relay.">Readers</button>
     <button id="export-btn" title="Download the stored reader list and the current log as one timestamped JSON file.">Export</button>
+    <button id="trace-btn" title="Download a full both-directions trace as JSON for debugging: ghost RX (reader→ghost) + ghost TX (ghost→reader) time-ordered on one clock, plus the mole APDU↔card-response log. Connect the board(s) you want in the trace.">Export trace</button>
     <button id="clear">Clear</button>
   </div>
   <div id="readers-panel" hidden style="background:#0f1114;border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px"></div>
@@ -138,6 +139,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260908anyboard"></script>
+<script src="relay.js?v=20260908trace"></script>
 </body>
 </html>
