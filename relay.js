@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08z cycle-timer-fix';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-09a cache-hit-breakdown';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -348,6 +348,17 @@ class ChameleonBLE {
   async rxCount() {
     try { const r = await this.sendCmd(CMD.HF14A_4_RX_LOG, u8([0]), 2000); return r.data.length ? r.data[0] : -1; }
     catch (_) { return -1; }
+  }
+  // Cumulative count of APDUs the ghost served from its static cache (in-ISR),
+  // in the trailing 4 bytes (LE) of the RX_LOG response. Lets the portal show
+  // cache-served vs relayed per tap. -1 if unavailable (old fw / short response).
+  async hitCount() {
+    try {
+      const r = await this.sendCmd(CMD.HF14A_4_RX_LOG, u8([0]), 2000);
+      const d = r.data; if (!d || d.length < 4) return -1;
+      const o = d.length - 4;
+      return d[o] | (d[o + 1] << 8) | (d[o + 2] << 16) | (d[o + 3] << 24);
+    } catch (_) { return -1; }
   }
   // Load one cached cmd->resp pair: cmd_len(1) cmd(n) resp_len_be16(2) resp(m).
   addStaticResponse(cmd, resp) {
@@ -763,7 +774,7 @@ async function startRelay() {
     // Transaction cycle timer: wall time from the FIRST APDU of a tap (card first
     // driven by the phone) to the LAST (phone finished reading). Logged when the
     // tap goes idle. This is the real "first contact -> fully read" number.
-    let tapT0 = null, tapN = 0, tapTlast = 0;
+    let tapT0 = null, tapN = 0, tapTlast = 0, lastHit = 0;   // lastHit: cache-serve count at prev tap end
     const EMPTY = new Uint8Array([0, 0]);  // resp_len 0 => pure blocking recv (send nothing)
     while (running) {
       // Clear-cache requested from the button: do it here, in the loop's own context
@@ -797,10 +808,13 @@ async function startRelay() {
         let r0;
         try { r0 = await ghost.apduSendRecv(EMPTY); } catch (_) { await sleep(pollDelay()); continue; }
         if (r0.status !== ST.SUCCESS) {
-          // Tap just ended -> report BOTH cycle spans.
+          // Tap just ended -> report cycle spans + cache-served/relayed breakdown.
           if (tapT0 !== null && tapN > 0) {
             const cache = cacheMode === 'prefill' ? 'cache ON' : 'cache OFF';
-            log(`=== transaction cycle (${cache}, ${tapN} APDUs): ghost↔phone ${(tapTlast - tapT0).toFixed(0)} ms (first phone command → last) · from first card touch ${(tapTlast - cardTouchT).toFixed(0)} ms (incl. the place-card→tap-phone gap) ===`, 'ok');
+            let served = -1;
+            if (cacheMode === 'prefill') { const h = await ghost.hitCount(); if (h >= 0) { served = h - lastHit; lastHit = h; } }
+            const mix = served >= 0 ? `${served} cache-served + ${tapN} relayed = ${served + tapN} cmds` : `${tapN} relayed`;
+            log(`=== transaction cycle (${cache}): ${mix} · ghost↔phone ${(tapTlast - tapT0).toFixed(0)} ms (first phone cmd→last) · from first card touch ${(tapTlast - cardTouchT).toFixed(0)} ms (incl. place→tap gap) ===`, 'ok');
             tapT0 = null; tapN = 0;
           }
           // idle (no APDU within the on-device block): mirror LED / Mode B disarm
