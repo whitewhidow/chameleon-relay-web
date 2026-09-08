@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '2026-09-08w faster-prefill';   // shown in the log so you can confirm which version loaded
+const BUILD = '2026-09-08x batch-load+bench';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -354,6 +354,25 @@ class ChameleonBLE {
     const p = concat(u8([cmd.length]), cmd, u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp);
     return this.sendCmd(CMD.HF14A_4_STATIC_RESP, p);
   }
+  // Load MANY pairs in as few commands as possible: the firmware parses multiple
+  // concatenated pairs from one frame, so this replaces N per-pair round-trips
+  // with ~1 (chunked to stay well under the 4 KB frame cap). Returns pairs loaded.
+  async addStaticResponseBatch(pairs) {
+    const MAX = 3000;   // bytes per frame, safely under NETDATA_MAX_DATA_LENGTH
+    let loaded = 0, chunk = [], size = 0;
+    const flush = async () => {
+      if (!chunk.length) return;
+      await this.sendCmd(CMD.HF14A_4_STATIC_RESP, concat(...chunk), 3000);
+      loaded += chunk.length; chunk = []; size = 0;
+    };
+    for (const p of pairs) {
+      const enc = concat(u8([p.cmd.length]), p.cmd, u8([(p.resp.length >> 8) & 0xff, p.resp.length & 0xff]), p.resp);
+      if (size + enc.length > MAX) await flush();
+      chunk.push(enc); size += enc.length;
+    }
+    await flush();
+    return loaded;
+  }
   apduRecv() { return this.sendCmd(CMD.HF14A_4_APDU_RECV, new Uint8Array(0), 2500); }
   apduSend(resp) { return this.sendCmd(CMD.HF14A_4_APDU_SEND, concat(u8([(resp.length >> 8) & 0xff, resp.length & 0xff]), resp)); }
   // Grouped: deliver `resp` (may be empty = pure blocking recv) AND wait on-device
@@ -635,11 +654,12 @@ async function armGhost(anti, slot, staticPairs) {
   await ghost.setAntiColl(anti);   // anti-coll BEFORE emulator mode
   if (staticPairs && staticPairs.length) {
     let n = 0;
-    for (const p of staticPairs) {
-      try { await ghost.addStaticResponse(p.cmd, p.resp); n++; cachedCmds.add(hxc(p.cmd)); } catch (e) {}
-    }
+    // Batch-load: one (or few) frames instead of one round-trip per pair.
+    try { n = await ghost.addStaticResponseBatch(staticPairs); for (const p of staticPairs) cachedCmds.add(hxc(p.cmd)); }
+    catch (e) { log('batch cache load failed, falling back to per-pair…', 'warn');
+      n = 0; for (const p of staticPairs) { try { await ghost.addStaticResponse(p.cmd, p.resp); n++; cachedCmds.add(hxc(p.cmd)); } catch (_) {} } }
     cacheCount = n; setCacheStatus('prefill');
-    log(`loaded ${n}/${staticPairs.length} cached responses into the ghost`, 'ok');
+    log(`loaded ${n}/${staticPairs.length} cached responses into the ghost (batched)`, 'ok');
   }
   await ghost.changeMode(false);   // tag / emulator mode
 }
