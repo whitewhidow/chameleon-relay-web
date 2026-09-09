@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260909 led-verdict-fix';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260909 fsc-nochain';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -754,6 +754,15 @@ async function armGhost(anti, slot, staticPairs, dev = ghost) {
   await dev.setSlotEnable(slot, SENSE_HF, true);
   try { await dev.clearStaticResponses(); } catch (e) {}  // safety: never serve a stale cache
   cacheReset();
+  // Advertise a LARGE frame size (FSC=256) in the ghost's ATS so the reader/POS
+  // never CHAINS a command to us. A card with a small FSCI makes the reader split
+  // a big-PDOL GPO into tiny frames; only the first chunk was reaching the card
+  // (truncated GPO -> 67 00). The ghost's RX buffer is 257 B, so it can take the
+  // whole command in one frame. ATS = [TL][T0]...; FSCI is T0's low nibble.
+  if (anti.ats && anti.ats.length >= 2) {
+    const fsci = anti.ats[1] & 0x0F;
+    if (fsci < 8) { anti.ats[1] = (anti.ats[1] & 0xF0) | 0x08; log(`ghost ATS FSCI ${fsci}->8 (FSC 256) so the reader won't chain commands`, 'ok'); }
+  }
   await dev.setAntiColl(anti);   // anti-coll BEFORE emulator mode
   if (staticPairs && staticPairs.length) {
     let n = 0;
