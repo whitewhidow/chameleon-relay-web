@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260909 lure-fix+gpolog';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260909 led-verdict-fix';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -1660,15 +1660,16 @@ async function buildRrpLure() {
 // not) on the tap. Builds the lure from your card first if none is saved yet.
 async function saveLureToSlot() {
   if (running || rrpTestRunning || sniffRunning) { log('stop the current session first', 'warn'); return; }
-  const dev = mole.connected ? mole : (ghost.connected ? ghost : null);
-  if (!dev) { log('connect a board first', 'err'); return; }
+  const boards = [ghost, mole].filter(b => b.connected);   // provision EVERY connected board
+  if (!boards.length) { log('connect a board first', 'err'); return; }
   const slot = parseInt($('lure-slot').value, 10) || 8;
   let lure = loadRrpLure();
   if (!lure) {
-    log(`no saved lure — reading your card on the ${dev.label} to build one first…`, 'warn');
-    await dev.changeMode(true);
+    const rdr = boards[0];
+    log(`no saved lure — reading your card on the ${rdr.label} to build one first…`, 'warn');
+    await rdr.changeMode(true);
     for (let i = 0; i < 40 && !lure; i++) {
-      try { if ((await dev.cardProbe(true)).status === ST.HF_TAG_OK) lure = await captureRrpLure(dev); } catch (_) {}
+      try { if ((await rdr.cardProbe(true)).status === ST.HF_TAG_OK) lure = await captureRrpLure(rdr); } catch (_) {}
       if (!lure) await sleep(300);
     }
     if (!lure) { log('could not read a card to build the lure', 'err'); return; }
@@ -1681,22 +1682,25 @@ async function saveLureToSlot() {
   pairs.push({ cmd: hexToBytes('80EA'), resp: hexToBytes('000000000001000200019000') }); // any 80 EA -> dummy RRP ok
   pairs.push({ cmd: hexToBytes('00B2'), resp: hexToBytes('6A83') });                       // any READ RECORD -> not found
   if (pairs.length > 12) log(`warning: ${pairs.length} responses exceed the 12 flash slots — extras go to RAM and won't persist standalone`, 'warn');
-  try {
-    log(`saving RRP lure to slot ${slot} — persisting to flash…`, 'warn');
-    await dev.setActiveSlot(slot);
-    await dev.setSlotTagType(slot, TAG_HF14A_4);
-    await dev.setSlotDataDefault(slot, TAG_HF14A_4);   // valid baseline record before we overwrite it
-    await dev.setSlotEnable(slot, SENSE_HF, true);
-    await dev.clearStaticResponses();
-    await dev.setAntiColl(lure.anti);
-    const n = await dev.addStaticResponseBatch(pairs);
-    await dev.saveSlotToFlash();
-    try { await dev.setSlotNick(slot, SENSE_HF, 'RRP-LURE'); } catch (_) {}
-    await dev.changeMode(false);   // leave it emulating on that slot, ready to tap
-    log(`✓ RRP lure saved to slot ${slot} (${n} responses persisted, named "RRP-LURE"). It survives reboot and localStorage clears. Standalone use: switch the board to slot ${slot} with its button and tap a POS — with the standalone-verdict firmware, RED LED = POS uses RRP, GREEN = it does not.`, 'ok');
-  } catch (e) {
-    log('save lure to slot failed: ' + e, 'err');
+  for (const dev of boards) {
+    try {
+      log(`saving RRP lure to slot ${slot} on the ${dev.label} — persisting to flash…`, 'warn');
+      await dev.setActiveSlot(slot);
+      await dev.setSlotTagType(slot, TAG_HF14A_4);
+      await dev.setSlotDataDefault(slot, TAG_HF14A_4);   // valid baseline record before we overwrite it
+      await dev.setSlotEnable(slot, SENSE_HF, true);
+      await dev.clearStaticResponses();
+      await dev.setAntiColl(lure.anti);
+      const n = await dev.addStaticResponseBatch(pairs);
+      await dev.saveSlotToFlash();
+      try { await dev.setSlotNick(slot, SENSE_HF, 'RRP-LURE'); } catch (_) {}
+      await dev.changeMode(false);   // leave it emulating on that slot, ready to tap
+      log(`✓ ${dev.label}: RRP lure saved to slot ${slot} (${n} responses persisted, named "RRP-LURE").`, 'ok');
+    } catch (e) {
+      log(`save lure to slot failed on the ${dev.label}: ${e}`, 'err');
+    }
   }
+  log(`Standalone use: switch the board to slot ${slot} with its button and tap a POS — with the standalone-verdict firmware, BLUE while tapping, then RED (POS uses RRP) / GREEN (no RRP).`, 'ok');
 }
 
 // RRP POS test: arm the GHOST with the saved lure and watch for 80 EA (ghost-only).
