@@ -58,9 +58,9 @@
             border: 1px solid var(--line); border-right: none; font-weight: 600; letter-spacing: .2px; }
   .txstep:first-child { border-top-left-radius: 6px; border-bottom-left-radius: 6px; }
   .txstep:last-child { border-right: 1px solid var(--line); border-top-right-radius: 6px; border-bottom-right-radius: 6px; }
-  .txstep.done { background: rgba(46,204,113,.16); color: var(--green); border-color: rgba(46,204,113,.4); }
-  .txstep.active { background: rgba(77,163,255,.18); color: var(--accent); border-color: var(--accent);
-                   box-shadow: 0 0 0 1px var(--accent) inset; }
+  .txstep.done { background: var(--green); color: #06210f; border-color: var(--green); font-weight: 700; }
+  .txstep.active { background: var(--accent); color: #041019; border-color: var(--accent); font-weight: 700;
+                   box-shadow: 0 0 10px var(--accent); }
   .txstep.active::after { content: ''; }
   footer { color: var(--muted); font-size: 12px; padding: 6px 20px 24px; max-width: 900px; margin: 0 auto; }
   code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
@@ -166,6 +166,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260909stable"></script>
+<script src="relay.js?v=20260909stepcol"></script>
 </body>
 </html>
