@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260909 lure-slot+stepper';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260909 lure-fix+gpolog';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -33,6 +33,7 @@ const CMD = {
   CHANGE_DEVICE_MODE: 1001,
   SET_ACTIVE_SLOT: 1003,
   SET_SLOT_TAG_TYPE: 1004,
+  SET_SLOT_DATA_DEFAULT: 1005,     // factory-init a slot's tag data: [slot][type BE]
   SET_SLOT_ENABLE: 1006,
   SET_SLOT_TAG_NICK: 1007,        // name a slot (persisted): [slot][sense][name bytes]
   SLOT_DATA_CONFIG_SAVE: 1009,    // commit active slot's data+config to flash (empty payload)
@@ -362,6 +363,10 @@ class ChameleonBLE {
   changeMode(reader) { return this.sendCmd(CMD.CHANGE_DEVICE_MODE, u8([reader ? 1 : 0])); }
   setActiveSlot(slot) { return this.sendCmd(CMD.SET_ACTIVE_SLOT, u8([slot - 1])); }
   setSlotTagType(slot, t) { return this.sendCmd(CMD.SET_SLOT_TAG_TYPE, u8([slot - 1, (t >> 8) & 0xff, t & 0xff])); }
+  // Factory-init a slot's tag data so its flash record is valid before we write
+  // anti-coll + static responses into it (a fresh slot has no valid HF14A_4
+  // record; without this the persisted slot won't emulate standalone).
+  setSlotDataDefault(slot, t) { return this.sendCmd(CMD.SET_SLOT_DATA_DEFAULT, u8([slot - 1, (t >> 8) & 0xff, t & 0xff]), 4000); }
   setSlotEnable(slot, sense, en) { return this.sendCmd(CMD.SET_SLOT_ENABLE, u8([slot - 1, sense, en ? 1 : 0])); }
   setAntiColl(a) {
     const p = concat(u8([a.uid.length]), a.uid, a.atqa, u8([a.sak]), u8([a.ats.length]), a.ats);
@@ -940,6 +945,14 @@ async function startRelay() {
       // class advances it. Resetting on PPSE makes it per-transaction, so several
       // taps in one relay session each get their own clean run.
       { const st = txStepFor(apdu); if (st === 0) txStepReset(); if (st >= 0) txStepMark(st); }
+      // Diagnostic: show the FULL command the ghost assembled for GPO / GENERATE AC
+      // (the state-critical, PDOL/CDOL-carrying commands). If a card with a big PDOL
+      // shows a short length here, the ghost truncated a multi-frame command.
+      if (apdu.length >= 2 && apdu[0] === 0x80 && (apdu[1] === 0xA8 || apdu[1] === 0xAE)) {
+        const nm = apdu[1] === 0xA8 ? 'GPO' : 'GEN AC';
+        const lc = apdu.length >= 5 ? apdu[4] : -1;
+        log(`>> ${nm} len=${apdu.length} (Lc=${lc}) ${hex(apdu).trim()}`, lc >= 0 && apdu.length < 5 + lc ? 'warn' : 'ok');
+      }
       // Terminal RRP enforcement: EXCHANGE RELAY RESISTANCE DATA (80 EA). If the
       // reader sends this, it is time-checking the relay (distance bounding).
       if (apdu.length >= 2 && apdu[0] === 0x80 && apdu[1] === 0xEA) {
@@ -1672,6 +1685,7 @@ async function saveLureToSlot() {
     log(`saving RRP lure to slot ${slot} — persisting to flash…`, 'warn');
     await dev.setActiveSlot(slot);
     await dev.setSlotTagType(slot, TAG_HF14A_4);
+    await dev.setSlotDataDefault(slot, TAG_HF14A_4);   // valid baseline record before we overwrite it
     await dev.setSlotEnable(slot, SENSE_HF, true);
     await dev.clearStaticResponses();
     await dev.setAntiColl(lure.anti);
