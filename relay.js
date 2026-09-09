@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260909 force-chain';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260909 stable-fsc256';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -754,20 +754,17 @@ async function armGhost(anti, slot, staticPairs, dev = ghost) {
   await dev.setSlotEnable(slot, SENSE_HF, true);
   try { await dev.clearStaticResponses(); } catch (e) {}  // safety: never serve a stale cache
   cacheReset();
-  // Advertise a SMALL frame size (FSC=24, FSCI=1) in the ghost's ATS. The nRF52
-  // NFCT deterministically TRUNCATES a large (~40B+) single reader->ghost frame
-  // (a big-PDOL GPO arrived as ~9 bytes -> card said 67 00), while small frames
-  // (SELECT etc., <=16 B) receive perfectly. A small FSC forces the reader to
-  // CHAIN any big command into small frames the NFCT receives reliably; the
-  // firmware's reader-chaining reassembly stitches them back into the full
-  // command, which is then relayed once over BLE (so no extra BLE round-trips --
-  // the extra chunks are fast local NFC handshakes only). Only commands larger
-  // than ~21 B chain; PPSE/SELECT/READ stay single-frame. ATS = [TL][T0]...;
-  // FSCI is T0's low nibble.
+  // Advertise a LARGE frame size (FSC=256, FSCI=8) in the ghost's ATS so the
+  // reader sends each command in ONE frame (no chaining). Forcing a SMALL FSC to
+  // make the reader chain a big GPO did NOT work: this reader ignores the
+  // advertised FSC and sends the big frame anyway, and forcing it wedged the T=CL
+  // flow. With FSC=256 normal cards relay fine (their commands fit one frame); a
+  // big-PDOL card whose command the nRF52 NFCT truncates on RX is dropped by the
+  // CRC guard (fails cleanly, card not corrupted) rather than relayed as garbage.
+  // ATS = [TL][T0]...; FSCI is T0's low nibble.
   if (anti.ats && anti.ats.length >= 2) {
     const fsci = anti.ats[1] & 0x0F;
-    anti.ats[1] = (anti.ats[1] & 0xF0) | 0x01;   // FSCI=1 -> FSC=24
-    log(`ghost ATS FSCI ${fsci}->1 (FSC 24) — reader chains big commands into small frames the NFCT can receive`, 'ok');
+    if (fsci < 8) { anti.ats[1] = (anti.ats[1] & 0xF0) | 0x08; log(`ghost ATS FSCI ${fsci}->8 (FSC 256)`, 'ok'); }
   }
   await dev.setAntiColl(anti);   // anti-coll BEFORE emulator mode
   if (staticPairs && staticPairs.length) {
