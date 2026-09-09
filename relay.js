@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260908 trace3';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260909 batt+ui';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -35,6 +35,7 @@ const CMD = {
   SET_SLOT_TAG_TYPE: 1004,
   SET_SLOT_ENABLE: 1006,
   GET_GIT_VERSION: 1017,
+  GET_BATTERY_INFO: 1025,   // -> [voltage_mV(2 BE)][percent(1)]
   HF14A_4_APDU_RECV: 6000,
   HF14A_4_APDU_SEND: 6001,
   HF14A_4_SET_ANTI_COLL: 6002,
@@ -240,7 +241,21 @@ class ChameleonBLE {
       const g = await this.sendCmd(CMD.GET_GIT_VERSION);
       this.git = new TextDecoder().decode(g.data);
     } catch (_) { this.git = ''; }
+    await this.readBattery();
     return this;
+  }
+
+  // Battery level (voltage + percent). Best-effort; safe to call any time the board
+  // is idle (don't call during a relay/test — the active loop monopolises BLE).
+  async readBattery() {
+    try {
+      const b = await this.sendCmd(CMD.GET_BATTERY_INFO, new Uint8Array(0), 2000);
+      if (b.data && b.data.length >= 3) {
+        this.battMv = (b.data[0] << 8) | b.data[1];
+        this.battPct = b.data[2];
+      }
+    } catch (_) {}
+    return this.battPct;
   }
 
   async disconnect() {
@@ -564,7 +579,8 @@ function setLedUI(who, color) {
 }
 
 function setDevUI(who, dev) {
-  $(who + '-status').textContent = dev.connected ? `connected  fw ${dev.fw}${dev.git ? '  git ' + dev.git : ''}` : 'not connected';
+  const batt = dev.connected && dev.battPct != null ? `  🔋 ${dev.battPct}%${dev.battMv ? ' (' + (dev.battMv / 1000).toFixed(2) + 'V)' : ''}` : '';
+  $(who + '-status').textContent = dev.connected ? `connected  fw ${dev.fw}${dev.git ? '  git ' + dev.git : ''}${batt}` : 'not connected';
   $(who + '-btn').textContent = dev.connected ? 'Disconnect' : 'Connect';
   $(who + '-card').classList.toggle('on', dev.connected);
   updateStartEnabled();
@@ -1782,6 +1798,14 @@ window.addEventListener('DOMContentLoaded', () => {
   if ($('readers-btn')) $('readers-btn').onclick = toggleReaders;
   if ($('export-btn')) $('export-btn').onclick = exportData;
   if ($('trace-btn')) $('trace-btn').onclick = exportTrace;
+  // Refresh battery % on connected boards every 60s, but only when idle (an active
+  // relay/test/sniff monopolises the BLE channel, so a battery read would collide).
+  setInterval(async () => {
+    if (running || rrpTestRunning || sniffRunning) return;
+    for (const [who, dev] of [['ghost', ghost], ['mole', mole]]) {
+      if (dev.connected) { await dev.readBattery(); setDevUI(who, dev); }
+    }
+  }, 60000);
   if ($('readers-panel')) $('readers-panel').addEventListener('click', e => {
     const b = e.target.closest('button'); if (!b) return;
     if (b.classList.contains('rdr-rename')) renameReader(b.dataset.id);

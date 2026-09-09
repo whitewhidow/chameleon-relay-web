@@ -48,8 +48,10 @@
          height: 340px; overflow: auto; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
          white-space: pre-wrap; word-break: break-all; }
   #log .ok { color: var(--green); } #log .warn { color: var(--amber); } #log .err { color: var(--red); }
-  .logbar { display: flex; align-items: center; gap: 10px; margin: 14px 0 6px; }
-  .logbar h3 { margin: 0; font-size: 13px; color: var(--muted); font-weight: 600; }
+  .logbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; row-gap: 8px; margin: 14px 0 6px; }
+  .logbar h3 { margin: 0 4px 0 0; font-size: 13px; color: var(--muted); font-weight: 600; }
+  .logbar button { white-space: nowrap; padding: 7px 12px; font-size: 13px; }
+  .bsep { width: 1px; align-self: stretch; min-height: 24px; background: var(--line); margin: 0 3px; }
   footer { color: var(--muted); font-size: 12px; padding: 6px 20px 24px; max-width: 900px; margin: 0 auto; }
   code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
 </style>
@@ -113,18 +115,26 @@
 
   <div class="logbar">
     <h3>Log</h3>
-    <button id="rxdump-btn">Dump RX</button>
-    <button id="clearcache-btn" title="Wipe the ghost's cached static responses AND the saved RRP POS-test lure (so it rebuilds from the card next time). Ghost connection only needed to clear the on-device cache.">Clear cache</button>
+    <!-- card diagnostics (card on the mole, relay stopped) -->
     <button id="rrp-btn" title="Diagnostic (your own card): read each AID's AIP relay-resistance bit and probe EXCHANGE RELAY RESISTANCE DATA (80 EA) to see if the card is relay-hardened. Card on the mole, relay stopped.">Check RRP</button>
     <button id="genac-btn" title="Diagnostic (your own card): run PPSE→SELECT→GPO→READ→GENERATE AC with synthetic terminal data and time GENERATE AC (+full round-trip estimate). Latency measurement only — the cryptogram is never submitted. Card on the mole, relay stopped.">Test payment</button>
-    <button id="lure-btn" title="Step 1 (any one board + your card): read your card and build a lure that ADVERTISES RRP (PPSE/SELECT/GPO, GPO AIP forced on), saved locally. Do this once per card/browser.">Build RRP lure</button>
-    <button id="rrptest-btn" title="Step 2 (any one board): the board emulates the saved RRP-advertising lure. Tap it on a POS — if the POS sends 80 EA it USES RRP; if it goes straight to READ RECORD it does NOT. Your phone (no RRP kernel) reads 'does NOT'.">RRP POS test</button>
+    <button id="cachesafe-btn" title="Diagnostic (your own card, mole-direct, no POS): proves GPO is state-critical — a live GPO yields a cryptogram but a cached/skipped GPO makes GENERATE AC fail. Shows why caching GPO breaks a real-POS payment. Card on the mole, relay stopped.">Cache-safety</button>
+    <span class="bsep"></span>
+    <!-- does a POS use RRP? build lure once, then tap on the POS -->
+    <button id="lure-btn" title="Step 1 (any one board + your card): read your card and build a lure that ADVERTISES RRP (PPSE/SELECT/GPO, GPO AIP forced on), saved locally. Do this once per card/browser.">Build lure</button>
+    <button id="rrptest-btn" title="Step 2 (any one board): the board emulates the saved RRP-advertising lure. Tap it on a POS — if the POS sends 80 EA it USES RRP; if it goes straight to READ RECORD it does NOT. Your phone (no RRP kernel) reads 'does NOT'.">RRP test</button>
+    <span class="bsep"></span>
+    <!-- capture / debug -->
+    <button id="rxdump-btn" title="Dump the ghost's RX ring buffer (raw reader→ghost frames) to the log.">Dump RX</button>
     <button id="sniff-btn" title="Passive sniff (one board): place it BETWEEN a real reader and a real card and run a transaction — logs every reader→card frame, so you can see if a real POS issued 80 EA (RRP). Reader→card only (the card's replies can't be heard on this hardware).">Passive sniff</button>
-    <button id="cachesafe-btn" title="Diagnostic (your own card, mole-direct, no POS): proves GPO is state-critical — a live GPO yields a cryptogram but a cached/skipped GPO makes GENERATE AC fail. Shows why caching GPO breaks a real-POS payment. Card on the mole, relay stopped.">Test cache-safety</button>
+    <button id="trace-btn" title="Download a full both-directions trace as JSON for debugging: ghost RX (reader→ghost) + ghost TX (ghost→reader) time-ordered on one clock, plus the mole APDU↔card-response log. Connect the board(s) you want in the trace.">Export trace</button>
+    <span class="bsep"></span>
+    <!-- data / housekeeping -->
+    <button id="clearcache-btn" title="Wipe the ghost's cached static responses AND the saved RRP POS-test lure (so it rebuilds from the card next time). Ghost connection only needed to clear the on-device cache.">Clear cache</button>
     <button id="readers-btn" title="Show the stored list of readers you've relayed against, each with its RRP verdict and captured terminal fingerprint. Readers with a fingerprint auto-recognise on the next relay.">Readers</button>
     <button id="export-btn" title="Download the stored reader list and the current log as one timestamped JSON file.">Export</button>
-    <button id="trace-btn" title="Download a full both-directions trace as JSON for debugging: ghost RX (reader→ghost) + ghost TX (ghost→reader) time-ordered on one clock, plus the mole APDU↔card-response log. Connect the board(s) you want in the trace.">Export trace</button>
-    <button id="clear">Clear</button>
+    <span class="bsep"></span>
+    <button id="clear" title="Clear the on-screen log.">Clear log</button>
   </div>
   <div id="readers-panel" hidden style="background:#0f1114;border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:8px"></div>
   <div id="log"></div>
@@ -139,6 +149,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260908trace3"></script>
+<script src="relay.js?v=20260909battui"></script>
 </body>
 </html>
