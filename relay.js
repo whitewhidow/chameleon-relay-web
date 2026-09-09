@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260909 tools5';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260909 rssi+decode';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -50,6 +50,7 @@ const CMD = {
   HF14A_4_APDU_SEND_RECV: 6012,   // send response AND block for next APDU (grouped)
   HF14A_4_RELAY_LOG: 6014,        // mole: relayed APDU + card response log (full trace)
   HF14A_4_TX_LOG: 6016,           // ghost: emulator TX frames (ghost->reader) for full trace
+  GET_BLE_RSSI: 6017,             // link RSSI (dBm, signed byte; 0 = n/a) of the connected central
   HF14A_SNIFF: 2020,              // passive HF-14A sniff (reader->card frames)
 };
 // status codes: HF_TAG_OK=0, HF_TAG_NO=1, STATUS_SUCCESS=104 (apdu_recv uses SUCCESS)
@@ -242,6 +243,7 @@ class ChameleonBLE {
       this.git = new TextDecoder().decode(g.data);
     } catch (_) { this.git = ''; }
     await this.readBattery();
+    await this.readRssi();
     return this;
   }
 
@@ -256,6 +258,14 @@ class ChameleonBLE {
       }
     } catch (_) {}
     return this.battPct;
+  }
+  // Link RSSI (dBm) of this BLE connection, as measured by the board. 0 = n/a.
+  async readRssi() {
+    try {
+      const r = await this.sendCmd(CMD.GET_BLE_RSSI, new Uint8Array(0), 2000);
+      if (r.data && r.data.length >= 1) { const v = r.data[0]; this.rssi = v > 127 ? v - 256 : v; }
+    } catch (_) {}
+    return this.rssi;
   }
 
   async disconnect() {
@@ -587,6 +597,10 @@ function setDevUI(who, dev) {
       const low = dev.battPct <= 20;
       const v = dev.battMv ? ` (${(dev.battMv / 1000).toFixed(2)}V)` : '';
       s += `  <span style="color:${low ? 'var(--red)' : 'var(--muted)'};font-weight:${low ? 700 : 400}">🔋 ${dev.battPct}%${v}${low ? ' LOW' : ''}</span>`;
+    }
+    if (dev.rssi) {   // dBm, negative; closer to 0 = stronger. weak (< -80) shown amber
+      const weak = dev.rssi < -80;
+      s += `  <span style="color:${weak ? 'var(--amber)' : 'var(--muted)'}">📶 ${dev.rssi} dBm${weak ? ' weak' : ''}</span>`;
     }
     el.innerHTML = s;
   }
@@ -1828,32 +1842,64 @@ function decodeFrame(b) {
   if ((p & 0xC0) === 0xC0) { if ((p & 0xF0) === 0xF0) return 'S(WTX)'; if ((p & 0xF7) === 0xC2) return 'S(DESELECT)'; if ((p & 0xF0) === 0xD0) return 'S(PPS)'; return `S 0x${p.toString(16)}`; }
   return `0x${p.toString(16).padStart(2, '0')}`;
 }
+// Card identity from a card response (for the "card changed" marker): PAN (tag 5A),
+// else track2 PAN (tag 57), else AIP (tag 82).
+function traceCardKey(b) {
+  if (!b || b.length < 3) return null;
+  const pan = tlvFind(b, 0x5A)[0]; if (pan) return 'PAN ' + hxc(pan);
+  const t2 = tlvFind(b, 0x57)[0]; if (t2 && t2.length >= 8) return 'PAN ' + hxc(t2).slice(0, 16);
+  const aip = tlvFind(b, 0x82)[0]; if (aip) return 'AIP ' + hxc(aip);
+  return null;
+}
+// Strip a leading T=CL I-block PCB (+CID/NAD) and trailing CRC to reach the APDU.
+function traceIblockPayload(b) {
+  if (!b.length) return b;
+  const p = b[0];
+  if ((p & 0xE0) === 0 && (p & 0x02)) { let o = 1; if (p & 0x08) o++; if (p & 0x04) o++; return b.slice(o, Math.max(o, b.length - 2)); }
+  return b;
+}
 async function decodeTrace() {
   if (running || rrpTestRunning || sniffRunning) { log('stop the running session first, then Decode trace', 'warn'); return; }
   if (!ghost.connected && !mole.connected) { log('connect a board first', 'err'); return; }
   const bytesOf = (h) => (!h || h === '(empty)') ? [] : h.split(' ').map(x => parseInt(x, 16));
-  log('════════ DECODED TRACE ════════', 'ok');
+  const lines = [`DECODED TRACE  ${new Date().toISOString()}  (build ${BUILD})`];
+  const put = s => lines.push(s);
   if (ghost.connected) {
     try {
       const rx = await ghost.sendCmd(CMD.HF14A_4_RX_LOG, u8([0]), 3000);
       const tx = await ghost.sendCmd(CMD.HF14A_4_TX_LOG, u8([0]), 3000);
       const frames = [
-        ...parseFrameLog(rx.data, true).map(f => ({ ...f, dir: 'R→G' })),
-        ...parseFrameLog(tx.data, false).map(f => ({ ...f, dir: 'G→R' })),
+        ...parseFrameLog(rx.data, true).map(f => ({ ...f, dir: 'R->G' })),
+        ...parseFrameLog(tx.data, false).map(f => ({ ...f, dir: 'G->R' })),
       ].sort((a, b) => a.ts - b.ts);
-      log(`── reader↔ghost · ${frames.length} frames ──`);
-      for (const f of frames) log(`  ${String(f.ms.toFixed(0)).padStart(7)}ms ${f.dir} ${decodeFrame(bytesOf(f.hex))}`);
-    } catch (e) { log('ghost decode failed: ' + (e.message || e), 'err'); }
+      put(''); put(`== reader<->ghost : ${frames.length} frames ==`);
+      let last = null;
+      for (const f of frames) {
+        const b = bytesOf(f.hex);
+        const k = traceCardKey(traceIblockPayload(b));
+        if (k && k !== last) { if (last !== null) put(`  ---- card changed -> ${k} ----`); last = k; }
+        put(`  ${String(f.ms.toFixed(0)).padStart(8)}ms ${f.dir} ${decodeFrame(b)}`);
+      }
+    } catch (e) { put('ghost decode failed: ' + (e.message || e)); }
   }
   if (mole.connected) {
     try {
       const rl = await mole.sendCmd(CMD.HF14A_4_RELAY_LOG, u8([0]), 3000);
       const ex = parseRelayLog(rl.data).sort((a, b) => a.ts - b.ts);
-      log(`── mole↔card · ${ex.length} exchanges ──`);
-      for (const e of ex) log(`  ${String(e.ms.toFixed(0)).padStart(7)}ms  ${apduName(bytesOf(e.apdu)) || e.apdu}  →  ${apduName(bytesOf(e.resp)) || e.resp || '(empty)'}${e.st ? '  st=' + e.st : ''}`);
-    } catch (e) { log('mole decode failed: ' + (e.message || e), 'err'); }
+      put(''); put(`== mole<->card : ${ex.length} exchanges ==`);
+      let last = null;
+      for (const e of ex) {
+        const k = traceCardKey(bytesOf(e.resp));
+        if (k && k !== last) { if (last !== null) put(`  ---- card changed -> ${k} ----`); last = k; }
+        put(`  ${String(e.ms.toFixed(0)).padStart(8)}ms  ${apduName(bytesOf(e.apdu)) || e.apdu}  ->  ${apduName(bytesOf(e.resp)) || e.resp || '(empty)'}${e.st ? '  st=' + e.st : ''}`);
+      }
+    } catch (e) { put('mole decode failed: ' + (e.message || e)); }
   }
-  log('════════ end decoded trace ════════', 'ok');
+  const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = `decoded-trace-${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.txt`;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 2000);
+  log(`decoded trace downloaded: ${lines.length - 1} lines → ${a.download}`, 'ok');
 }
 
 // Readers → CSV (tested-terminals dataset).
@@ -1897,7 +1943,7 @@ window.addEventListener('DOMContentLoaded', () => {
   setInterval(async () => {
     if (running || rrpTestRunning || sniffRunning) return;
     for (const [who, dev] of [['ghost', ghost], ['mole', mole]]) {
-      if (dev.connected) { await dev.readBattery(); setDevUI(who, dev); }
+      if (dev.connected) { await dev.readBattery(); await dev.readRssi(); setDevUI(who, dev); }
     }
   }, 60000);
   if ($('readers-panel')) $('readers-panel').addEventListener('click', e => {
