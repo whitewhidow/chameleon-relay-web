@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260909 batt+ui';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260909 ring+rrpdb';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -660,8 +660,7 @@ async function toggleConnect(who) {
     log(`select board for ${who.toUpperCase()} (${who === 'ghost' ? 'terminal/phone side' : 'card side'})…`);
     dev.onDisconnect = () => { log(`${who} disconnected`, 'warn'); setDevUI(who, dev); if (running) stopRelay(); };
     await dev.connect();
-    log(`${who.toUpperCase()} connected: fw ${dev.fw} git ${dev.git}`, 'ok');
-    if (dev.fw && !dev.fw.startsWith('99')) log(`warning: ${who} fw is ${dev.fw}, expected 99.x relay firmware`, 'warn');
+    log(`${who.toUpperCase()} connected: fw ${dev.fw}${dev.git ? ' git ' + dev.git : ''}${dev.battPct != null ? ' · 🔋 ' + dev.battPct + '%' : ''}`, 'ok');
     // Connected + idle (no relay running) = AMBER on both boards. The relay
     // states (green = card responding, red = no card, blue = relaying) take over
     // once you Start, and it returns to amber on Stop.
@@ -1278,7 +1277,7 @@ function renderReaders() {
        + `<td>${esc(rrpLabel(r.rrp))}</td>`
        + `<td style="color:var(--muted)">${esc(sum)}</td>`
        + `<td>${r.seen}</td>`
-       + `<td style="color:var(--muted)">${new Date(r.last).toLocaleDateString()}</td>`
+       + `<td style="color:var(--muted);white-space:nowrap">${new Date(r.last).toLocaleString()}</td>`
        + `<td style="white-space:nowrap"><button class="rdr-rename" data-id="${r.id}" style="padding:3px 8px">Rename</button> <button class="rdr-del" data-id="${r.id}" style="padding:3px 8px">Delete</button></td>`
        + `</tr>`;
   }
@@ -1583,7 +1582,13 @@ async function rrpPosTest() {
     await armGhost(lure.anti, slot, lure.pairs, dev);
     dev.setLed(1).catch(() => {});
     const EMPTY = new Uint8Array(0);
-    let pending = EMPTY, verdict = null, idle = 0;
+    let pending = EMPTY, verdict = null, idle = 0, sessionStored = false;
+    const storeVerdict = (rrpState) => {
+      if (sessionStored) return;
+      sessionStored = true;
+      const rec = recordReader({}, rrpState);   // no fingerprint (empty-PDOL lure) — user names it
+      if (rec) { log(`stored in Readers as "${rec.name}" (${rrpLabel(rec.rrp)}) — rename it to this terminal`, 'ok'); const p = $('readers-panel'); if (p && !p.hidden) renderReaders(); }
+    };
     while (rrpTestRunning) {
       let r; try { r = await dev.apduSendRecv(pending, 600); } catch (_) { pending = EMPTY; continue; }
       pending = EMPTY;
@@ -1594,11 +1599,11 @@ async function rrpPosTest() {
       idle = 0;
       const apdu = r.data;
       if (apdu.length >= 2 && apdu[0] === 0x80 && apdu[1] === 0xEA) {
-        if (verdict !== 'rrp') log('✓✓ POS SENT 80 EA (EXCHANGE RELAY RESISTANCE DATA) — THIS POS USES RRP', 'warn');
+        if (verdict !== 'rrp') { log('✓✓ POS SENT 80 EA (EXCHANGE RELAY RESISTANCE DATA) — THIS POS USES RRP', 'warn'); storeVerdict('enforced'); }
         setRrpBadge('enforced'); verdict = 'rrp';
         pending = hexToBytes('000000000001000200019000');   // dummy RRP response so the POS proceeds
       } else if (apdu.length >= 2 && apdu[0] === 0x00 && apdu[1] === 0xB2) {
-        if (!verdict) { log('POS went to READ RECORD after GPO with NO 80 EA — THIS POS does NOT use RRP', 'ok'); setRrpBadge('clear'); verdict = 'norrp'; }
+        if (!verdict) { log('POS went to READ RECORD after GPO with NO 80 EA — THIS POS does NOT use RRP', 'ok'); setRrpBadge('clear'); verdict = 'norrp'; storeVerdict('no-ea'); }
         pending = hexToBytes('6A83');
       } else {
         // After a verdict the reader often brute-forces its whole AID list (our
