@@ -128,6 +128,7 @@
     <button id="rxdump-btn" title="Dump the ghost's RX ring buffer (raw reader→ghost frames) to the log.">Dump RX</button>
     <button id="sniff-btn" title="Passive sniff (one board): place it BETWEEN a real reader and a real card and run a transaction — logs every reader→card frame, so you can see if a real POS issued 80 EA (RRP). Reader→card only (the card's replies can't be heard on this hardware).">Passive sniff</button>
     <button id="trace-btn" title="Download a full both-directions trace as JSON for debugging: ghost RX (reader→ghost) + ghost TX (ghost→reader) time-ordered on one clock, plus the mole APDU↔card-response log. Connect the board(s) you want in the trace.">Export trace</button>
+    <button id="decode-btn" title="Print a human-readable, annotated transcript of the current capture to the log (PCB type + APDU name for every frame) — reader↔ghost then mole↔card. Stop the session first.">Decode trace</button>
     <span class="bsep"></span>
     <!-- data / housekeeping -->
     <button id="clearcache-btn" title="Wipe the ghost's cached static responses AND the saved RRP POS-test lure (so it rebuilds from the card next time). Ghost connection only needed to clear the on-device cache.">Clear cache</button>
@@ -149,6 +150,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260909ringdb"></script>
+<script src="relay.js?v=20260909tools5"></script>
 </body>
 </html>

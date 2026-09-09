@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260909 ring+rrpdb';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260909 tools5';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -579,8 +579,17 @@ function setLedUI(who, color) {
 }
 
 function setDevUI(who, dev) {
-  const batt = dev.connected && dev.battPct != null ? `  🔋 ${dev.battPct}%${dev.battMv ? ' (' + (dev.battMv / 1000).toFixed(2) + 'V)' : ''}` : '';
-  $(who + '-status').textContent = dev.connected ? `connected  fw ${dev.fw}${dev.git ? '  git ' + dev.git : ''}${batt}` : 'not connected';
+  const el = $(who + '-status');
+  if (!dev.connected) { el.textContent = 'not connected'; }
+  else {
+    let s = `connected  fw ${esc(dev.fw)}${dev.git ? '  git ' + esc(dev.git) : ''}`;
+    if (dev.battPct != null) {
+      const low = dev.battPct <= 20;
+      const v = dev.battMv ? ` (${(dev.battMv / 1000).toFixed(2)}V)` : '';
+      s += `  <span style="color:${low ? 'var(--red)' : 'var(--muted)'};font-weight:${low ? 700 : 400}">🔋 ${dev.battPct}%${v}${low ? ' LOW' : ''}</span>`;
+    }
+    el.innerHTML = s;
+  }
   $(who + '-btn').textContent = dev.connected ? 'Disconnect' : 'Connect';
   $(who + '-card').classList.toggle('on', dev.connected);
   updateStartEnabled();
@@ -956,6 +965,10 @@ async function startRelay() {
       // timing: wait = time to obtain this APDU (~0 if pre-fetched), relay = mole
       // round-trip, sendrecv = deliver response + on-device wait for the next APDU
       log(`     t: wait ${wait.toFixed(0)}ms · relay ${(tRelay - tGot).toFixed(0)}ms · sendrecv ${(tSend - tRelay).toFixed(0)}ms`);
+      if (apdu.length >= 2 && apdu[0] === 0x80 && apdu[1] === 0xEA) {
+        const rt = tSend - tGot;   // the round-trip the POS time-checks (relay to card + deliver back)
+        log(`     ⚠ RRP TIMING: 80 EA round-trip ≈ ${rt.toFixed(0)}ms vs the ~sub-millisecond a POS distance-bound allows → ~${Math.max(1, Math.round(rt)).toLocaleString()}× over budget, so an enforcing terminal time-rejects this relay`, 'warn');
+      }
       if (!resp.length) log('empty card response — terminal will likely abort this APDU', 'warn');
       // LED reflects the actual relay result: green = card responded, red = mole
       // not answering (no card). Drive the ghost BOARD LED on TRANSITIONS only
@@ -1268,7 +1281,8 @@ function renderReaders() {
   const panel = $('readers-panel'); if (!panel) return;
   const list = loadReaders().sort((a, b) => b.last - a.last);
   if (!list.length) { panel.innerHTML = '<div style="color:var(--muted);padding:8px 4px">No readers stored yet. Run a relay against a reader (RRP verdict is stored even when no fingerprint is captured, but only fingerprinted readers auto-recognise).</div>'; return; }
-  let h = '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+  let h = `<div style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center"><span style="color:var(--muted)">${list.length} reader(s) — RRP verdicts + last-seen</span><button class="rdr-csv" style="padding:4px 10px">Download CSV</button></div>`
+        + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
         + '<tr style="color:var(--muted);text-align:left"><th style="padding:4px 6px">Reader</th><th>RRP</th><th>Terminal</th><th>Seen</th><th>Last</th><th></th></tr>';
   for (const r of list) {
     const sum = r.fp ? readerSummary(unhexTags(r.tags)) : '(no fingerprint — name it yourself)';
@@ -1782,6 +1796,80 @@ async function exportTrace() {
   log(`exported full trace: ${gc} ghost frames (reader↔ghost), ${mc} mole exchanges (mole↔card) → ${a.download}`, 'ok');
 }
 
+// ---------------------------------------------------------------------------
+// Trace DECODER: read a fresh capture and print a human-readable annotated
+// transcript to the log (PCB type + APDU name), instead of raw hex JSON.
+function apduName(a) {
+  if (!a || a.length < 1) return '';
+  const c = a[0], i = a.length >= 2 ? a[1] : -1;
+  if (c === 0x00 && i === 0xA4) return hex(a).includes('32 50 41 59 2E 53 59 53') ? 'SELECT PPSE' : 'SELECT AID ' + (a.length > 5 ? hxc(a.slice(5, 5 + a[4])) : '');
+  if (c === 0x80 && i === 0xA8) return 'GPO';
+  if (c === 0x00 && i === 0xB2) return `READ RECORD sfi${a[3] >> 3} rec${a[2]}`;
+  if (c === 0x80 && i === 0xCA) return 'GET DATA ' + hxc(a.slice(2, 4));
+  if (c === 0x80 && i === 0xEA) return 'EXCHANGE RELAY RESISTANCE DATA (RRP)';
+  if (c === 0x80 && i === 0xAE) return 'GENERATE AC';
+  if (c === 0x6F) return 'resp FCI';
+  if (c === 0x77) return 'resp GPO (AIP/AFL)';
+  if (c === 0x70) return 'resp record';
+  if (c === 0x9F) return 'resp GET DATA';
+  if (a.length >= 2) { const sw = ((a[a.length - 2] << 8) | a[a.length - 1]).toString(16).toUpperCase().padStart(4, '0'); if (/^(9000|6[0-9A-F]{3})$/.test(sw)) return 'SW ' + sw; }
+  return '';
+}
+function decodeFrame(b) {
+  if (!b || !b.length) return '(empty)';
+  const p = b[0];
+  if (p === 0x26) return 'REQA';
+  if (p === 0x52) return 'WUPA';
+  if (p === 0x93 || p === 0x95 || p === 0x97) return `anticoll/SELECT CL${(p - 0x91) / 2}`;
+  if (p === 0xE0 || p === 0xE1) return 'RATS';
+  if (p === 0x50 && b[1] === 0x00) return 'HLTA';
+  if ((p & 0xE0) === 0x00 && (p & 0x02)) { let off = 1; if (p & 0x08) off++; if (p & 0x04) off++; const a = b.slice(off, Math.max(off, b.length - 2)); return `I(${p & 1}${p & 0x10 ? ',chain' : ''}) ${apduName(a)}`.trim(); }
+  if ((p & 0xE6) === 0xA2) return `R(${p & 0x10 ? 'NAK' : 'ACK'}) blk${p & 1}`;
+  if ((p & 0xC0) === 0xC0) { if ((p & 0xF0) === 0xF0) return 'S(WTX)'; if ((p & 0xF7) === 0xC2) return 'S(DESELECT)'; if ((p & 0xF0) === 0xD0) return 'S(PPS)'; return `S 0x${p.toString(16)}`; }
+  return `0x${p.toString(16).padStart(2, '0')}`;
+}
+async function decodeTrace() {
+  if (running || rrpTestRunning || sniffRunning) { log('stop the running session first, then Decode trace', 'warn'); return; }
+  if (!ghost.connected && !mole.connected) { log('connect a board first', 'err'); return; }
+  const bytesOf = (h) => (!h || h === '(empty)') ? [] : h.split(' ').map(x => parseInt(x, 16));
+  log('════════ DECODED TRACE ════════', 'ok');
+  if (ghost.connected) {
+    try {
+      const rx = await ghost.sendCmd(CMD.HF14A_4_RX_LOG, u8([0]), 3000);
+      const tx = await ghost.sendCmd(CMD.HF14A_4_TX_LOG, u8([0]), 3000);
+      const frames = [
+        ...parseFrameLog(rx.data, true).map(f => ({ ...f, dir: 'R→G' })),
+        ...parseFrameLog(tx.data, false).map(f => ({ ...f, dir: 'G→R' })),
+      ].sort((a, b) => a.ts - b.ts);
+      log(`── reader↔ghost · ${frames.length} frames ──`);
+      for (const f of frames) log(`  ${String(f.ms.toFixed(0)).padStart(7)}ms ${f.dir} ${decodeFrame(bytesOf(f.hex))}`);
+    } catch (e) { log('ghost decode failed: ' + (e.message || e), 'err'); }
+  }
+  if (mole.connected) {
+    try {
+      const rl = await mole.sendCmd(CMD.HF14A_4_RELAY_LOG, u8([0]), 3000);
+      const ex = parseRelayLog(rl.data).sort((a, b) => a.ts - b.ts);
+      log(`── mole↔card · ${ex.length} exchanges ──`);
+      for (const e of ex) log(`  ${String(e.ms.toFixed(0)).padStart(7)}ms  ${apduName(bytesOf(e.apdu)) || e.apdu}  →  ${apduName(bytesOf(e.resp)) || e.resp || '(empty)'}${e.st ? '  st=' + e.st : ''}`);
+    } catch (e) { log('mole decode failed: ' + (e.message || e), 'err'); }
+  }
+  log('════════ end decoded trace ════════', 'ok');
+}
+
+// Readers → CSV (tested-terminals dataset).
+function exportReadersCsv() {
+  const list = loadReaders();
+  if (!list.length) { log('no readers stored yet', 'warn'); return; }
+  const q = s => `"${String(s == null ? '' : s).replace(/"/g, '""')}"`;
+  const rows = ['name,rrp,fingerprint,terminal,seen,first,last'];
+  for (const r of list) rows.push([q(r.name), q(rrpLabel(r.rrp)), q(r.fp || ''), q(r.fp ? readerSummary(unhexTags(r.tags)) : ''), r.seen, q(new Date(r.first).toISOString()), q(new Date(r.last).toISOString())].join(','));
+  const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = `readers-${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.csv`;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 2000);
+  log(`exported ${list.length} reader(s) → ${a.download}`, 'ok');
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   if (!navigator.bluetooth) {
     log('Web Bluetooth is not available in this browser. Use desktop or Android Chrome/Edge (not iOS Safari).', 'err');
@@ -1803,6 +1891,7 @@ window.addEventListener('DOMContentLoaded', () => {
   if ($('readers-btn')) $('readers-btn').onclick = toggleReaders;
   if ($('export-btn')) $('export-btn').onclick = exportData;
   if ($('trace-btn')) $('trace-btn').onclick = exportTrace;
+  if ($('decode-btn')) $('decode-btn').onclick = decodeTrace;
   // Refresh battery % on connected boards every 60s, but only when idle (an active
   // relay/test/sniff monopolises the BLE channel, so a battery read would collide).
   setInterval(async () => {
@@ -1815,6 +1904,7 @@ window.addEventListener('DOMContentLoaded', () => {
     const b = e.target.closest('button'); if (!b) return;
     if (b.classList.contains('rdr-rename')) renameReader(b.dataset.id);
     else if (b.classList.contains('rdr-del')) deleteReader(b.dataset.id);
+    else if (b.classList.contains('rdr-csv')) exportReadersCsv();
   });
   $('link-btn').onclick = toggleLink;
   $('wake-btn').onclick = wakeServer;
