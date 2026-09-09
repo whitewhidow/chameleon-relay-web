@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260909 stepper-hide';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260909 batt-retry';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -253,13 +253,22 @@ class ChameleonBLE {
   // Battery level (voltage + percent). Best-effort; safe to call any time the board
   // is idle (don't call during a relay/test — the active loop monopolises BLE).
   async readBattery() {
-    try {
-      const b = await this.sendCmd(CMD.GET_BATTERY_INFO, new Uint8Array(0), 2000);
-      if (b.data && b.data.length >= 3) {
-        this.battMv = (b.data[0] << 8) | b.data[1];
-        this.battPct = b.data[2];
-      }
-    } catch (_) {}
+    // The firmware samples the battery ADC on a 5s timer; right after a BLE
+    // connect (which wakes the board) batt_lvl is still its init 0 until the
+    // first tick. Reading once then would show 0% (esp. on battery, no USB). So
+    // if we get a 0mV reading, retry a few times past that 5s window — the way
+    // the official GUI shows a real value on its refresh cycle.
+    for (let i = 0; i < 4; i++) {
+      try {
+        const b = await this.sendCmd(CMD.GET_BATTERY_INFO, new Uint8Array(0), 2000);
+        if (b.data && b.data.length >= 3) {
+          this.battMv = (b.data[0] << 8) | b.data[1];
+          this.battPct = b.data[2];
+        }
+      } catch (_) {}
+      if (this.battMv > 0) break;   // got a real sample
+      if (i < 3) await sleep(2500); // else wait past the firmware's 5s ADC tick and retry
+    }
     return this.battPct;
   }
   // Link RSSI (dBm) of this BLE connection, as measured by the board. 0 = n/a.
@@ -2066,14 +2075,14 @@ window.addEventListener('DOMContentLoaded', () => {
   if ($('export-btn')) $('export-btn').onclick = exportData;
   if ($('trace-btn')) $('trace-btn').onclick = exportTrace;
   if ($('decode-btn')) $('decode-btn').onclick = decodeTrace;
-  // Refresh battery % on connected boards every 60s, but only when idle (an active
+  // Refresh battery % on connected boards every 30s, but only when idle (an active
   // relay/test/sniff monopolises the BLE channel, so a battery read would collide).
   setInterval(async () => {
     if (running || rrpTestRunning || sniffRunning) return;
     for (const [who, dev] of [['ghost', ghost], ['mole', mole]]) {
       if (dev.connected) { await dev.readBattery(); await dev.readRssi(); setDevUI(who, dev); }
     }
-  }, 60000);
+  }, 30000);
   if ($('readers-panel')) $('readers-panel').addEventListener('click', e => {
     const b = e.target.closest('button'); if (!b) return;
     if (b.classList.contains('rdr-rename')) renameReader(b.dataset.id);
