@@ -54,6 +54,7 @@
   .bsep { width: 1px; align-self: stretch; min-height: 24px; background: var(--line); margin: 0 3px; }
   /* transaction progress stepper (lights up as each EMV step is relayed) */
   .txsteps { display: flex; flex-wrap: wrap; align-items: center; gap: 0; margin: 10px 0 2px; font-size: 12.5px; }
+  .txsteps[hidden] { display: none; }   /* class display:flex would otherwise override the hidden attr */
   .txstep { position: relative; padding: 5px 14px 5px 16px; background: var(--panel2); color: var(--muted);
             border: 1px solid var(--line); border-right: none; font-weight: 600; letter-spacing: .2px; }
   .txstep:first-child { border-top-left-radius: 6px; border-bottom-left-radius: 6px; }
@@ -166,6 +167,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260909stepcol"></script>
+<script src="relay.js?v=20260909stephide"></script>
 </body>
 </html>
