@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260910 esb-slot';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260910 ble-reconnect';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -220,6 +220,8 @@ class ChameleonBLE {
     // 23-byte minimum MTU — see _write.
     this.mtu = 244;
     this.onDisconnect = null;
+    this._wantConnected = false;   // true between connect() and an intentional disconnect()
+    this._reconnecting = false;    // an auto-reconnect loop is running
   }
 
   get connected() { return !!(this.device && this.device.gatt && this.device.gatt.connected); }
@@ -229,9 +231,18 @@ class ChameleonBLE {
       filters: [{ namePrefix: 'Chameleon' }],
       optionalServices: [NUS_SERVICE],
     });
+    this._wantConnected = true;
     this.device.addEventListener('gattserverdisconnected', () => {
       if (this.onDisconnect) this.onDisconnect();
     });
+    await this._establish();
+    return this;
+  }
+
+  // (Re)establish the GATT link on the ALREADY-selected device -- no requestDevice,
+  // so no user gesture needed. Used by connect() and by auto-reconnect after a range
+  // drop (this.device.gatt.connect() rejects while out of range; retry until it's back).
+  async _establish() {
     const server = await this.device.gatt.connect();
     const svc = await server.getPrimaryService(NUS_SERVICE);
     this.rx = await svc.getCharacteristic(NUS_RX);
@@ -247,7 +258,6 @@ class ChameleonBLE {
     } catch (_) { this.git = ''; }
     await this.readBattery();
     await this.readRssi();
-    return this;
   }
 
   // Battery level (voltage + percent). Best-effort; safe to call any time the board
@@ -281,6 +291,7 @@ class ChameleonBLE {
   }
 
   async disconnect() {
+    this._wantConnected = false;   // intentional -> onDisconnect must NOT auto-reconnect
     try { if (this.device && this.device.gatt.connected) this.device.gatt.disconnect(); } catch (_) {}
   }
 
@@ -736,7 +747,12 @@ async function toggleConnect(who) {
   if (dev.connected) { await dev.disconnect(); return; }
   try {
     log(`select board for ${who.toUpperCase()} (${who === 'ghost' ? 'terminal/phone side' : 'card side'})…`);
-    dev.onDisconnect = () => { log(`${who} disconnected`, 'warn'); setDevUI(who, dev); if (running) stopRelay(); };
+    dev.onDisconnect = () => {
+      setDevUI(who, dev);
+      if (running) { log(`${who} dropped — relay stopped (will resume on reconnect)`, 'warn'); dev._relayWasRunning = true; stopRelay(); }
+      if (dev._wantConnected) { log(`${who} out of BLE range — auto-reconnecting…`, 'warn'); autoReconnect(who, dev); }
+      else log(`${who} disconnected`, 'warn');
+    };
     await dev.connect();
     log(`${who.toUpperCase()} connected: fw ${dev.fw}${dev.git ? ' git ' + dev.git : ''}${dev.battPct != null ? ' · 🔋 ' + dev.battPct + '%' : ''}`, 'ok');
     // Connected + idle (no relay running) = AMBER on both boards. The relay
@@ -749,6 +765,39 @@ async function toggleConnect(who) {
     setDevUI(who, dev);
   } catch (e) {
     log(`${who} connect failed: ${e.message || e}`, 'err');
+  }
+}
+
+// Auto-reconnect a board that dropped out of BLE range. No user gesture needed --
+// the device stays permitted, so we just retry device.gatt.connect() (via _establish)
+// which rejects while out of range and succeeds the moment it's back. Retries for
+// ~6 min (covers the board's 5-min stay-awake-after-drop window). On success restores
+// the idle LED and, if a relay was running and BOTH boards are back, resumes it.
+async function autoReconnect(who, dev) {
+  if (dev._reconnecting) return;
+  dev._reconnecting = true;
+  const deadline = Date.now() + 6 * 60 * 1000;
+  let tries = 0;
+  while (dev._wantConnected && !dev.connected && Date.now() < deadline) {
+    tries++;
+    try { await dev._establish(); } catch (_) { /* still out of range */ }
+    if (dev.connected) break;
+    await sleep(3000);
+  }
+  dev._reconnecting = false;
+  if (dev.connected) {
+    log(`${who.toUpperCase()} reconnected (${tries} tr${tries === 1 ? 'y' : 'ies'})`, 'ok');
+    try { await dev.setLed(5); } catch (_) {}   // amber idle
+    setLedUI(who, 'amber');
+    setDevUI(who, dev);
+    if ((ghost._relayWasRunning || mole._relayWasRunning) && ghost.connected && mole.connected && !running) {
+      ghost._relayWasRunning = mole._relayWasRunning = false;
+      log('both boards back in range — resuming relay…', 'ok');
+      try { await startRelay(); } catch (e) { log(`auto-resume failed: ${e.message || e}`, 'err'); }
+    }
+  } else if (dev._wantConnected) {
+    log(`${who} auto-reconnect gave up (out of range > ~6 min). Click Connect to retry.`, 'err');
+    setDevUI(who, dev);
   }
 }
 
@@ -2107,14 +2156,20 @@ window.addEventListener('DOMContentLoaded', () => {
   if ($('export-btn')) $('export-btn').onclick = exportData;
   if ($('trace-btn')) $('trace-btn').onclick = exportTrace;
   if ($('decode-btn')) $('decode-btn').onclick = decodeTrace;
-  // Refresh battery % on connected boards every 30s, but only when idle (an active
-  // relay/test/sniff monopolises the BLE channel, so a battery read would collide).
+  // Poll connected boards while idle (an active relay/test/sniff monopolises BLE,
+  // so a read would collide -> skip then). RSSI every ~3s so the signal display is
+  // responsive for positioning; battery every ~30s (it changes slowly).
+  let _pollTick = 0;
   setInterval(async () => {
     if (running || rrpTestRunning || sniffRunning) return;
+    _pollTick++;
     for (const [who, dev] of [['ghost', ghost], ['mole', mole]]) {
-      if (dev.connected) { await dev.readBattery(); await dev.readRssi(); setDevUI(who, dev); }
+      if (!dev.connected) continue;
+      await dev.readRssi();
+      if (_pollTick % 10 === 0) await dev.readBattery();
+      setDevUI(who, dev);
     }
-  }, 30000);
+  }, 3000);
   if ($('readers-panel')) $('readers-panel').addEventListener('click', e => {
     const b = e.target.closest('button'); if (!b) return;
     if (b.classList.contains('rdr-rename')) renameReader(b.dataset.id);
