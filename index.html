@@ -145,6 +145,10 @@
     <label style="font-size:12px;color:var(--muted)" title="Slot to write the standalone ESB (2.4GHz direct-link) trigger onto. Keep it separate from your relay and lure slots.">ESB slot <input type="number" id="esb-slot" value="7" min="1" max="8" style="width:44px"></label>
     <button id="esb-save-btn" title="Write the standalone direct-link trigger slot to each connected board: the GHOST board gets a slot named ESB-GHOST, the MOLE board ESB-MOLE (HF14A_4, persisted). Then with NO host: cycle a board to that slot with its button — it blinks (green=ghost / blue=mole) ~2s and arms the phone-free 2.4GHz relay on battery. Overwrites the chosen slot, so pick an empty one.">Save ESB slots</button>
     <span class="bsep"></span>
+    <!-- standalone board-to-board BLE relay trigger slot (no host/phone needed to arm) -->
+    <label style="font-size:12px;color:var(--muted)" title="Slot to write the standalone BB-GHOST (board-to-board BLE relay) trigger onto. Keep it separate from your relay and lure slots.">BB slot <input type="number" id="bb-slot" value="6" min="1" max="8" style="width:44px"></label>
+    <button id="bb-save-btn" title="Write a slot named BB-GHOST (HF14A_4, persisted) to EVERY connected board, so either can lead. Then with NO host/phone: cycle ONE board to that slot with its button — it connects to the other board over BLE (~2s) as the ghost and the OTHER board auto-becomes the mole (just needs to be powered). Put a card on the mole, tap a terminal on the ghost. Only ONE board on this slot at a time. Overwrites the chosen slot, so pick an empty one.">Save BB-GHOST slot</button>
+    <span class="bsep"></span>
     <!-- capture / debug -->
     <button id="rxdump-btn" title="Dump the ghost's RX ring buffer (raw reader→ghost frames) to the log.">Dump RX</button>
     <button id="sniff-btn" title="Passive sniff (one board): place it BETWEEN a real reader and a real card and run a transaction — logs every reader→card frame, so you can see if a real POS issued 80 EA (RRP). Reader→card only (the card's replies can't be heard on this hardware).">Passive sniff</button>
@@ -171,6 +175,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260910reconn"></script>
+<script src="relay.js?v=20260910bbghost"></script>
 </body>
 </html>

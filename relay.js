@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260910 ble-reconnect';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260910 bb-ghost-slot';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -1804,6 +1804,36 @@ async function saveEsbSlots() {
   log(`Standalone: on each board cycle to slot ${slot} with its button — it blinks (green=ghost / blue=mole) ~2s, then arms the phone-free 2.4GHz relay on battery. Power-cycle to exit.`, 'ok');
 }
 
+// Standalone board-to-board BLE relay trigger. Writes a slot nicked "BB-GHOST"
+// (HF14A_4, persisted) to EVERY connected board, so either board can lead: cycle
+// a board to that slot with its button and it arms the phone-free BLE relay as the
+// ghost -- the OTHER board (on any normal slot, just powered) auto-becomes the mole
+// (the ghost drives its mode over BLE). Only ONE board on BB-GHOST at a time.
+async function saveBbSlot() {
+  if (running || rrpTestRunning || sniffRunning) { log('stop the current session first', 'warn'); return; }
+  const slot = parseInt($('bb-slot').value, 10) || 6;
+  const jobs = [];
+  if (ghost.connected) jobs.push(ghost);
+  if (mole.connected)  jobs.push(mole);
+  if (!jobs.length) { log('connect a board first', 'err'); return; }
+  for (const dev of jobs) {
+    try {
+      log(`writing BB-GHOST to slot ${slot} on the ${dev.label} — persisting to flash…`, 'warn');
+      await dev.setActiveSlot(slot);
+      await dev.setSlotTagType(slot, TAG_HF14A_4);
+      await dev.setSlotDataDefault(slot, TAG_HF14A_4);   // valid HF14A_4 baseline (also the emulation slot the card clones onto)
+      await dev.setSlotEnable(slot, SENSE_HF, true);
+      await dev.setSlotNick(slot, SENSE_HF, 'BB-GHOST');
+      await dev.saveSlotToFlash();
+      await dev.changeMode(false);                        // leave it emulating on that slot
+      log(`✓ ${dev.label}: slot ${slot} = BB-GHOST (saved).`, 'ok');
+    } catch (e) {
+      log(`write BB-GHOST to slot ${slot} failed on the ${dev.label}: ${e}`, 'err');
+    }
+  }
+  log(`Standalone: with NO host, cycle ONE board to slot ${slot} with its button — it connects to the other board over BLE (~2s), the other auto-becomes the mole. Put a card on the mole, tap a terminal on the ghost. Only one board on slot ${slot} at a time.`, 'ok');
+}
+
 // RRP POS test: arm the GHOST with the saved lure and watch for 80 EA (ghost-only).
 async function rrpPosTest() {
   if (rrpTestRunning) { rrpTestRunning = false; log('stopping RRP POS test…', 'warn'); return; }
@@ -2148,6 +2178,7 @@ window.addEventListener('DOMContentLoaded', () => {
   if ($('lure-btn')) $('lure-btn').onclick = buildRrpLure;
   if ($('lure-save-btn')) $('lure-save-btn').onclick = saveLureToSlot;
   if ($('esb-save-btn')) $('esb-save-btn').onclick = saveEsbSlots;
+  if ($('bb-save-btn')) $('bb-save-btn').onclick = saveBbSlot;
   if ($('rrptest-btn')) $('rrptest-btn').onclick = rrpPosTest;
   if ($('sniff-btn')) $('sniff-btn').onclick = passiveSniff;
   if ($('genac-btn')) $('genac-btn').onclick = testPayment;
