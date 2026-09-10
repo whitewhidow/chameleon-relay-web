@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260909 batt-retry';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260910 esb-slot';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -1724,6 +1724,37 @@ async function saveLureToSlot() {
   log(`Standalone use: switch the board to slot ${slot} with its button and tap a POS — with the standalone-verdict firmware, BLUE while tapping, then RED (POS uses RRP) / GREEN (no RRP).`, 'ok');
 }
 
+// Write the STANDALONE 2.4GHz direct-link trigger slot to each connected board:
+// the GHOST board gets a slot nicknamed ESB-GHOST, the MOLE board ESB-MOLE (both
+// HF14A_4, persisted to flash). With the standalone-arming firmware, cycling a
+// board to that slot then blinks (green=ghost / blue=mole) ~2s and arms the
+// phone-free relay -- no host/USB needed. Unlike the lure, no card data is baked
+// in: the ghost clones the mole's real card live over 2.4GHz once armed.
+async function saveEsbSlots() {
+  if (running || rrpTestRunning || sniffRunning) { log('stop the current session first', 'warn'); return; }
+  const slot = parseInt($('esb-slot').value, 10) || 7;
+  const jobs = [];
+  if (ghost.connected) jobs.push([ghost, 'ESB-GHOST']);
+  if (mole.connected)  jobs.push([mole,  'ESB-MOLE']);
+  if (!jobs.length) { log('connect a board first (as ghost and/or mole)', 'err'); return; }
+  for (const [dev, nick] of jobs) {
+    try {
+      log(`writing ${nick} to slot ${slot} on the ${dev.label} — persisting to flash…`, 'warn');
+      await dev.setActiveSlot(slot);
+      await dev.setSlotTagType(slot, TAG_HF14A_4);
+      await dev.setSlotDataDefault(slot, TAG_HF14A_4);   // valid HF14A_4 baseline
+      await dev.setSlotEnable(slot, SENSE_HF, true);
+      await dev.setSlotNick(slot, SENSE_HF, nick);
+      await dev.saveSlotToFlash();
+      await dev.changeMode(false);                        // leave it emulating on that slot
+      log(`✓ ${dev.label}: slot ${slot} = ${nick} (saved).`, 'ok');
+    } catch (e) {
+      log(`write ${nick} to slot ${slot} failed on the ${dev.label}: ${e}`, 'err');
+    }
+  }
+  log(`Standalone: on each board cycle to slot ${slot} with its button — it blinks (green=ghost / blue=mole) ~2s, then arms the phone-free 2.4GHz relay on battery. Power-cycle to exit.`, 'ok');
+}
+
 // RRP POS test: arm the GHOST with the saved lure and watch for 80 EA (ghost-only).
 async function rrpPosTest() {
   if (rrpTestRunning) { rrpTestRunning = false; log('stopping RRP POS test…', 'warn'); return; }
@@ -2067,6 +2098,7 @@ window.addEventListener('DOMContentLoaded', () => {
   if ($('rrp-btn')) $('rrp-btn').onclick = checkRRP;
   if ($('lure-btn')) $('lure-btn').onclick = buildRrpLure;
   if ($('lure-save-btn')) $('lure-save-btn').onclick = saveLureToSlot;
+  if ($('esb-save-btn')) $('esb-save-btn').onclick = saveEsbSlots;
   if ($('rrptest-btn')) $('rrptest-btn').onclick = rrpPosTest;
   if ($('sniff-btn')) $('sniff-btn').onclick = passiveSniff;
   if ($('genac-btn')) $('genac-btn').onclick = testPayment;

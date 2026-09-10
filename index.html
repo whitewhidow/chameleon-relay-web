@@ -141,6 +141,10 @@
     <button id="lure-save-btn" title="Persist the built lure into the chosen slot's flash so it survives a reboot / localStorage clear and works standalone: switch the board to that slot with its button and tap a POS. Builds from your card first if none is saved. Adds an 80 EA answer + a READ RECORD fallback so the card is self-sufficient with no host.">Save lure to slot</button>
     <button id="rrptest-btn" title="Step 2 (any one board): the board emulates the saved RRP-advertising lure. Tap it on a POS — if the POS sends 80 EA it USES RRP; if it goes straight to READ RECORD it does NOT. Your phone (no RRP kernel) reads 'does NOT'.">RRP test</button>
     <span class="bsep"></span>
+    <!-- standalone 2.4GHz direct-link trigger slots (no host needed to arm) -->
+    <label style="font-size:12px;color:var(--muted)" title="Slot to write the standalone ESB (2.4GHz direct-link) trigger onto. Keep it separate from your relay and lure slots.">ESB slot <input type="number" id="esb-slot" value="7" min="1" max="8" style="width:44px"></label>
+    <button id="esb-save-btn" title="Write the standalone direct-link trigger slot to each connected board: the GHOST board gets a slot named ESB-GHOST, the MOLE board ESB-MOLE (HF14A_4, persisted). Then with NO host: cycle a board to that slot with its button — it blinks (green=ghost / blue=mole) ~2s and arms the phone-free 2.4GHz relay on battery. Overwrites the chosen slot, so pick an empty one.">Save ESB slots</button>
+    <span class="bsep"></span>
     <!-- capture / debug -->
     <button id="rxdump-btn" title="Dump the ghost's RX ring buffer (raw reader→ghost frames) to the log.">Dump RX</button>
     <button id="sniff-btn" title="Passive sniff (one board): place it BETWEEN a real reader and a real card and run a transaction — logs every reader→card frame, so you can see if a real POS issued 80 EA (RRP). Reader→card only (the card's replies can't be heard on this hardware).">Passive sniff</button>
@@ -167,6 +171,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260909battretry"></script>
+<script src="relay.js?v=20260910esbslot"></script>
 </body>
 </html>
