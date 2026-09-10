@@ -138,8 +138,7 @@
     <!-- does a POS use RRP? build lure once, then tap on the POS -->
     <label style="font-size:12px;color:var(--muted)" title="Slot the persistent RRP lure is saved to and tested from. Keep it separate from your relay slot.">lure slot <input type="number" id="lure-slot" value="8" min="1" max="8" style="width:44px"></label>
     <button id="lure-btn" title="Step 1 (any one board + your card): read your card and build a lure that ADVERTISES RRP (PPSE/SELECT/GPO, GPO AIP forced on), saved locally. Do this once per card/browser.">Build lure</button>
-    <button id="lure-save-btn" title="Persist the built lure into the chosen slot's flash so it survives a reboot / localStorage clear and works standalone: switch the board to that slot with its button and tap a POS. Builds from your card first if none is saved. Adds an 80 EA answer + a READ RECORD fallback so the card is self-sufficient with no host.">Save lure to slot</button>
-    <button id="rrptest-btn" title="Step 2 (any one board): the board emulates the saved RRP-advertising lure. Tap it on a POS — if the POS sends 80 EA it USES RRP; if it goes straight to READ RECORD it does NOT. Your phone (no RRP kernel) reads 'does NOT'.">RRP test</button>
+    <button id="lure-save-btn" title="Persist the built lure into the chosen slot's flash so it survives a reboot / localStorage clear and works standalone: switch the board to that slot with its button and tap a POS. Builds from your card first if none is saved. Adds an 80 EA answer + a READ RECORD fallback so the card is self-sufficient with no host. Then run the RRP POS test STANDALONE: cycle the board to that slot, tap a POS, read the on-device LED (blue armed -> red POS uses RRP / green no RRP).">Save lure to slot</button>
     <span class="bsep"></span>
     <!-- standalone 2.4GHz direct-link trigger slots (no host needed to arm) -->
     <label style="font-size:12px;color:var(--muted)" title="Slot to write the standalone ESB (2.4GHz direct-link) trigger onto. Keep it separate from your relay and lure slots.">ESB slot <input type="number" id="esb-slot" value="7" min="1" max="8" style="width:44px"></label>
@@ -175,6 +174,6 @@
   Mole phone serves. Latency adds one internet round-trip per APDU.
 </footer>
 
-<script src="relay.js?v=20260910bbghost"></script>
+<script src="relay.js?v=20260910rrpstandalone"></script>
 </body>
 </html>

@@ -18,7 +18,7 @@
  */
 'use strict';
 
-const BUILD = '20260910 bb-ghost-slot';   // shown in the log so you can confirm which version loaded
+const BUILD = '20260910 rrp-standalone';   // shown in the log so you can confirm which version loaded
 
 // --- Nordic UART Service (verified in firmware ble_main.c / ble_nus) ---------
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -1835,67 +1835,10 @@ async function saveBbSlot() {
 }
 
 // RRP POS test: arm the GHOST with the saved lure and watch for 80 EA (ghost-only).
-async function rrpPosTest() {
-  if (rrpTestRunning) { rrpTestRunning = false; log('stopping RRP POS test…', 'warn'); return; }
-  if (running || sniffRunning) { log('stop the current session first', 'warn'); return; }
-  const dev = ghost.connected ? ghost : (mole.connected ? mole : null);   // whichever board is connected
-  if (!dev) { log('connect a board first (the one you tap on the POS)', 'err'); return; }
-  const lure = loadRrpLure();
-  if (!lure) { log('no saved lure — put your card on a connected board and click "Build RRP lure" first', 'err'); return; }
-  const slot = parseInt($('lure-slot').value, 10) || parseInt($('slot').value, 10) || 8;
-  log(`RRP POS test: using saved lure (${lure.pairs.length} responses) on slot ${slot}.`, 'ok');
-
-  rrpTestRunning = true;
-  if ($('rrptest-btn')) $('rrptest-btn').textContent = 'Stop RRP test';
-  setRrpBadge('watch');
-  log(`=== RRP POS TEST armed: the ${dev.label} is emulating an RRP-advertising card. TAP IT ON THE POS. ===`, 'ok');
-  try {
-    await armGhost(lure.anti, slot, lure.pairs, dev);
-    dev.setLed(6).catch(() => {}); setLedUI(dev.label, 'blue');   // blue: armed, waiting for the tap
-    const EMPTY = new Uint8Array(0);
-    let pending = EMPTY, verdict = null, idle = 0, sessionStored = false;
-    const storeVerdict = (rrpState) => {
-      if (sessionStored) return;
-      sessionStored = true;
-      const rec = recordReader({}, rrpState);   // no fingerprint (empty-PDOL lure) — user names it
-      if (rec) { log(`stored in Readers as "${rec.name}" (${rrpLabel(rec.rrp)}) — rename it to this terminal`, 'ok'); const p = $('readers-panel'); if (p && !p.hidden) renderReaders(); }
-    };
-    while (rrpTestRunning) {
-      let r; try { r = await dev.apduSendRecv(pending, 600); } catch (_) { pending = EMPTY; continue; }
-      pending = EMPTY;
-      if (r.status !== ST.SUCCESS) {           // no APDU this window
-        if (verdict && ++idle > 3) { log('— tap ended; tap again to re-test, or Stop —', 'ok'); verdict = null; idle = 0; setRrpBadge('watch');
-          dev.setLed(6).catch(() => {}); setLedUI(dev.label, 'blue'); }   // re-arm blue for the next tap
-        continue;
-      }
-      idle = 0;
-      const apdu = r.data;
-      if (apdu.length >= 2 && apdu[0] === 0x80 && apdu[1] === 0xEA) {
-        if (verdict !== 'rrp') { log('✓✓ POS SENT 80 EA (EXCHANGE RELAY RESISTANCE DATA) — THIS POS USES RRP', 'warn'); storeVerdict('enforced'); }
-        setRrpBadge('enforced'); verdict = 'rrp';
-        dev.setLed(7).catch(() => {}); setLedUI(dev.label, 'red');   // red: POS uses RRP
-        pending = hexToBytes('000000000001000200019000');   // dummy RRP response so the POS proceeds
-      } else if (apdu.length >= 2 && apdu[0] === 0x00 && apdu[1] === 0xB2) {
-        if (!verdict) { log('POS went to READ RECORD after GPO with NO 80 EA — THIS POS does NOT use RRP', 'ok'); setRrpBadge('clear'); verdict = 'norrp'; storeVerdict('no-ea');
-          dev.setLed(8).catch(() => {}); setLedUI(dev.label, 'green'); }   // green: no RRP
-        pending = hexToBytes('6A83');
-      } else {
-        // After a verdict the reader often brute-forces its whole AID list (our
-        // lure only answers 2 AIDs) — that's normal; log only before the verdict.
-        if (!verdict) log('  ghost saw: ' + hex(apdu).trim());
-        pending = hexToBytes('6D00');
-      }
-    }
-  } catch (e) {
-    log('RRP POS test error: ' + e, 'err');
-  } finally {
-    try { await dev.changeMode(true); } catch (_) {}
-    dev.setLed(5).catch(() => {});
-    rrpTestRunning = false;
-    if ($('rrptest-btn')) $('rrptest-btn').textContent = 'RRP POS test';
-    log('=== RRP POS TEST stopped ===', 'ok');
-  }
-}
+// (Removed the browser-driven "RRP test" button/loop — the RRP POS test is now
+// standalone-only: Save lure to slot, then cycle the board to that slot and tap a
+// POS, reading the on-device verdict LED. "Build lure" + "Save lure to slot" set
+// that up; "Check RRP" (card diagnostic) stays.)
 
 // ---------------------------------------------------------------------------
 // PASSIVE SNIFF (item 1): eavesdrop the reader->card command stream of a REAL
@@ -2179,7 +2122,6 @@ window.addEventListener('DOMContentLoaded', () => {
   if ($('lure-save-btn')) $('lure-save-btn').onclick = saveLureToSlot;
   if ($('esb-save-btn')) $('esb-save-btn').onclick = saveEsbSlots;
   if ($('bb-save-btn')) $('bb-save-btn').onclick = saveBbSlot;
-  if ($('rrptest-btn')) $('rrptest-btn').onclick = rrpPosTest;
   if ($('sniff-btn')) $('sniff-btn').onclick = passiveSniff;
   if ($('genac-btn')) $('genac-btn').onclick = testPayment;
   if ($('cachesafe-btn')) $('cachesafe-btn').onclick = testCacheSafety;
